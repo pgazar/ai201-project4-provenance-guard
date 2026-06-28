@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local cache from prelabel.py (not needed in the repo)
+prelabel_cache.json
+
+# Optional: uncomment if you don't want the raw saved JSON in the repo
+# raw_json/

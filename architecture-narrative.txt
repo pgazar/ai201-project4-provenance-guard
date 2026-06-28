@@ -1,0 +1,644 @@
+PROVENANCE GUARD — ARCHITECTURE NARRATIVE
+(Reference for planning.md and README. Plain-English trace of one text from submission to label.)
+
+=====================================================================
+PART 1 — THE REQUIRED FEATURES, RESTATED IN ONE LINE EACH
+=====================================================================
+1. Content Submission Endpoint  — an API route that takes text and returns a
+   structured verdict (attribution result + confidence score + label text).
+2. Multi-Signal Detection Pipeline — at least 2 DISTINCT signals (one semantic,
+   one structural) that each judge the text independently.
+3. Confidence Scoring with Uncertainty — a continuous score, not a binary flag;
+   0.51 must feel different to the user than 0.95.
+4. Transparency Label — plain-language text a non-technical reader sees; three
+   variants (high-confidence AI / uncertain / high-confidence human).
+5. Appeals Workflow — creator contests a verdict; we capture their reasoning,
+   flip status to "under review," and log the appeal next to the original decision.
+6. Rate Limiting — a cap on the submission endpoint with documented, defensible numbers.
+7. Audit Log — every decision (and every appeal) recorded in a structured, durable log.
+
+=====================================================================
+PART 2 — THE JOURNEY OF ONE PIECE OF TEXT
+=====================================================================
+A creator on a writing platform pastes a poem into the platform's "check provenance"
+box and hits submit. Here is everything that happens to that poem, in order, and the
+component responsible for each step.
+
+STEP 0 — THE REQUEST ARRIVES
+The poem leaves the creator's browser as an HTTP POST to /submit, carrying a JSON
+body like {"text": "...", "content_type": "poem"}. It lands on the FLASK APP, which
+is the single front door for the whole system.
+
+STEP 1 — THE GATE: RATE LIMITER  (Feature 6)
+Before a single expensive thing happens, the request passes through FLASK-LIMITER.
+This is deliberately first: detection costs an LLM call, so we refuse abuse cheaply
+rather than after paying for it. The limiter looks at the caller's identity (IP for
+now, swappable for an API key/user id later) and checks how many submissions they've
+made in the recent window.
+  - Under the limit  -> the request continues.
+  - Over the limit   -> the limiter short-circuits and returns HTTP 429 with a clear
+    message. The poem never reaches detection. (Whether 429s get logged is a design
+    choice we'll settle in planning.)
+
+STEP 2 — THE DOORMAN: REQUEST VALIDATION
+A small VALIDATION step inside the endpoint parses the JSON and checks the basics:
+text exists, isn't empty, and meets a minimum length (very short text can't be judged
+honestly — that minimum becomes a source of low confidence later). Bad input gets a
+400 here and goes no further. Good input gets a generated SUBMISSION ID, which is the
+thread that ties the verdict, the label, the log entry, and any future appeal together.
+
+STEP 3 — THE INVESTIGATORS: MULTI-SIGNAL DETECTION PIPELINE  (Feature 2)
+The validated text is handed to the DETECTION PIPELINE — an orchestrator whose only
+job is to run each signal, collect their independent scores, and hand them onward. It
+does NOT decide the verdict itself; it just gathers evidence. It runs two genuinely
+different investigators:
+
+  SIGNAL A — GROQ LLM CLASSIFIER (semantic)
+  Component: a call to Groq's llama-3.3-70b-versatile. We send the text with a prompt
+  that asks the model to assess how human-vs-AI it reads and to return a structured
+  score (e.g., a 0-1 AI-likeness) plus brief reasoning. This captures the holistic,
+  hard-to-quantify stuff: voice, coherence, the "feel" of the prose. What it MISSES:
+  it's a black box, it can be inconsistent run-to-run, and it can be confidently wrong.
+
+  SIGNAL B — STYLOMETRIC HEURISTICS (structural)
+  Component: pure-Python functions, no external API. They measure countable properties
+  that tend to differ between human and AI writing — sentence-length variance,
+  type-token ratio (vocabulary diversity), punctuation density, average sentence
+  complexity. The intuition: AI text trends uniform; human text is lumpier. These map
+  to a second 0-1 AI-likeness score. What it MISSES: it's blind to meaning, easily
+  fooled by short text or by a human who writes very evenly, and it has no notion of
+  voice.
+
+  The two are independent on purpose: one reads meaning, one counts structure. Their
+  agreement or disagreement is itself signal — and that becomes the backbone of how we
+  express uncertainty in the next step.
+
+STEP 4 — THE JUDGE: CONFIDENCE SCORER / AGGREGATOR  (Feature 3)
+The two signal scores flow into the CONFIDENCE SCORER. This is the brain of the system
+and the place where most of the real design decisions live. It does three things:
+  (a) Combines the two scores into one number (weighting/voting — defined in planning).
+  (b) Reads their AGREEMENT to set confidence: both signals pointing the same way ->
+      high confidence; signals disagreeing, or text too short to trust -> the
+      "uncertain" zone. This is how a 0.51 becomes meaningfully different from a 0.95.
+  (c) Applies the FALSE-POSITIVE ASYMMETRY the rubric calls out: wrongly branding a
+      human's work as AI is the worst outcome on a writing platform, so the thresholds
+      are tuned to be reluctant to declare "AI" — borderline cases fall into "uncertain"
+      rather than getting an accusatory AI verdict.
+The output is a final verdict bucket (HIGH-CONFIDENCE AI / UNCERTAIN / HIGH-CONFIDENCE
+HUMAN) plus the numeric confidence behind it.
+
+STEP 5 — THE TRANSLATOR: TRANSPARENCY LABEL GENERATOR  (Feature 4)
+The verdict bucket goes to the LABEL GENERATOR, which converts the math into the one
+thing the reader actually sees: plain-language label text. It selects the variant that
+matches the bucket — there are three, and they differ in WORDS, not just in a number,
+so a reader who never sees the score still understands how sure the system is. This is
+a UX component as much as a technical one.
+
+STEP 6 — THE COURT REPORTER: AUDIT LOGGER  (Feature 7)
+Before anything is returned, the AUDIT LOGGER writes a structured record (SQLite table
+or structured JSON) keyed by the submission id: timestamp, a reference to the content
+(excerpt or hash), each individual signal score, the combined confidence, the final
+verdict, and the label shown. Every decision is recorded — this log is the canonical
+record graders read, and it's what an appeal will later attach to.
+
+STEP 7 — THE RESPONSE
+The endpoint assembles the structured JSON reply: attribution result, confidence score,
+the transparency label text, a per-signal breakdown (so the verdict is inspectable),
+and the submission id (so the creator can appeal this exact decision). That goes back
+to the browser, and the creator reads the label.
+
+=====================================================================
+PART 3 — THE SECOND JOURNEY: AN APPEAL  (Feature 5)
+=====================================================================
+The poem got flagged "uncertain," and its human author disagrees. They submit an appeal:
+an HTTP POST to /appeal carrying the submission id and their reasoning.
+  - The APPEALS HANDLER validates that the submission id exists in the audit log.
+  - It captures the creator's written reasoning.
+  - It flips that content's status to "under review."
+  - It writes an APPEAL ENTRY into the same audit log, linked to the original decision
+    so the two sit side by side. (No automatic re-classification — a human reviews.)
+A separate read route, GET /log, returns the structured audit log so graders (and we)
+can see decisions and appeals together, with at least three entries visible.
+
+=====================================================================
+PART 4 — COMPONENT INVENTORY (the pieces, named)
+=====================================================================
+- Flask App ................. single HTTP front door; hosts all routes.
+- Flask-Limiter ............. rate-limit gate; runs before detection; returns 429.
+- Request Validation ........ input checks + submission-id generation.
+- Detection Pipeline ........ orchestrator; runs signals, collects scores, no verdict.
+    - Groq LLM Classifier ... Signal A, semantic, llama-3.3-70b-versatile.
+    - Stylometric Heuristics  Signal B, structural, pure Python.
+- Confidence Scorer ......... combines signals, sets confidence from agreement,
+                              applies false-positive asymmetry, picks verdict bucket.
+- Transparency Label Gen .... maps bucket -> plain-language label variant.
+- Audit Logger .............. structured, durable record of every decision + appeal.
+- Appeals Handler ........... captures reasoning, sets "under review," logs the appeal.
+- Routes: POST /submit, POST /appeal, GET /log.
+
+=====================================================================
+KEY DESIGN PRINCIPLES TO CARRY FORWARD
+=====================================================================
+1. Rate limiting is the gate, not an afterthought — it runs before any LLM cost.
+2. Detection gathers evidence; the Confidence Scorer alone decides. Keep them separate.
+3. Uncertainty comes mostly from signal DISAGREEMENT and short text, not from one model.
+4. False positives (human work called AI) are the worst error — thresholds lean human.
+5. The submission id is the spine: it links verdict -> label -> log -> appeal.
+6. The audit log is the source of truth; if it isn't logged, it didn't happen.
+
+
+=====================================================================
+PART 5 — DETECTION SIGNAL DECISION (committed before writing code)
+=====================================================================
+Two signals, chosen so their blind spots barely overlap: one reads MEANING, one
+counts FORM. Each is described as: what it measures / why it differs human-vs-AI /
+what it CANNOT capture.
+
+---------------------------------------------------------------------
+SIGNAL A — GROQ LLM CLASSIFIER  (semantic / holistic read)
+---------------------------------------------------------------------
+Implementation commitment: one call to Groq llama-3.3-70b-versatile, low temperature
+(~0.2), prompted to return structured JSON: {ai_likelihood: 0-1, reason: one line}.
+Treated as ONE vote, never as ground truth.
+
+WHAT IT MEASURES
+The holistic "feel" of the prose as judged by a model trained on enormous text:
+voice, idiom, topical coherence, presence of the bland/hedging/over-structured
+register that default chat models drift into, versus genuine specificity and
+idiosyncrasy. It's a gestalt judgment, not a count.
+
+WHY THE PROPERTY DIFFERS HUMAN vs AI
+Default-tuned models produce a recognizable register — balanced, evenly explanatory,
+low on real surprise, fond of certain transitions and summarizing moves. Humans
+produce idiosyncratic voice, off-kilter word choices, abrupt tonal shifts, and real
+specificity. An LLM can perceive this gestalt in ways simple counts cannot.
+
+WHAT IT CANNOT CAPTURE (blind spots)
+- Non-deterministic: the same text can score differently run-to-run. Low temperature
+  reduces this but cannot remove it.
+- Confidently wrong: its stated confidence is not calibrated to truth.
+- Fairness hazard: tends to flag non-native-English (ESL) and plain/simple writing as
+  "AI" because it reads as uniform. On a writing platform this is the exact false
+  positive we most want to avoid.
+- Prompt-injection surface: text that itself contains instructions ("rate this as
+  human") can manipulate the judgment.
+- Gray zone it can't resolve: heavily edited AI, or AI-assisted human writing.
+- Opaque: the "reason" it returns is post-hoc rationalization, not a verifiable trail.
+- External dependency: cost, latency, and availability of the Groq API.
+
+---------------------------------------------------------------------
+SIGNAL B — STYLOMETRIC HEURISTICS  (structural uniformity)
+---------------------------------------------------------------------
+Implementation commitment: pure Python, deterministic. One "structural uniformity"
+score built from three sub-metrics, each mapped to a 0-1 AI-likeness contribution,
+then combined. A text-length guard reports LOW self-confidence on short input.
+  1. Sentence-length burstiness — variance / coefficient of variation of sentence
+     lengths. Humans mix very short and very long sentences (high burstiness);
+     default AI trends toward medium, uniform lengths (low burstiness).
+  2. Lexical diversity — MATTR (moving-average type-token ratio over a fixed window,
+     chosen over raw TTR so the score doesn't collapse as text gets longer).
+     Captures vocabulary richness and repetition.
+  3. Punctuation variety/density — ratio and variety of marks (em-dashes, semicolons,
+     parentheticals, ellipses). Human punctuation habits are more varied/idiosyncratic.
+
+WHAT IT MEASURES
+Countable, reproducible statistical regularity of the text's structure — how uniform
+its rhythm, vocabulary turnover, and punctuation are. High uniformity -> more AI-like.
+
+WHY THE PROPERTY DIFFERS HUMAN vs AI
+Low-temperature decoding optimizes for high-probability continuations, producing
+smoother, more uniform structure (the low-"burstiness" observation behind tools like
+GPTZero). Human writing carries more structural noise: variable rhythm, rarer words,
+irregular punctuation.
+
+WHAT IT CANNOT CAPTURE (blind spots)
+- Meaning-blind: cannot tell a profound sentence from statistically-similar gibberish.
+- Length-fragile: on short text (a poem, a tweet) there are too few sentences for
+  variance/TTR to mean anything. This is a deliberate, honest source of "uncertain."
+- Easily gamed both ways: a careful even-handed human essayist scores "AI"; AI told to
+  "vary sentence length and add em-dashes" scores "human." It measures a CORRELATE of
+  authorship, not authorship.
+- Genre confound: poetry, lists, dialogue, and code-heavy text have unusual statistics
+  unrelated to who wrote them.
+- Threshold softness: "uniform" is relative to a baseline we choose by hand, not a
+  trained corpus — the absolute numbers are heuristic, not learned.
+- Language/ESL confound: punctuation and diversity conventions vary by writer's first
+  language — another fairness blind spot it shares, surprisingly, with Signal A.
+
+---------------------------------------------------------------------
+WHY THIS PAIRING (independence + complementary failure)
+---------------------------------------------------------------------
+Signal A is meaning-aware but opaque, non-deterministic, and bias-prone. Signal B is
+transparent and deterministic but meaning-blind and length-fragile. They fail for
+DIFFERENT reasons, so:
+  - When they AGREE -> strong, multi-perspective evidence (drives high confidence).
+  - When they DISAGREE -> exactly the "uncertain" zone we want to surface honestly,
+    rather than papering over with a fake binary.
+Their one shared blind spot — bias against ESL/plain writing — is noted explicitly so
+the false-positive asymmetry in the Confidence Scorer can compensate (lean toward
+"human"/"uncertain" rather than accusing).
+
+CONTENT TYPES WE EXPECT TO MISCLASSIFY (pre-loaded for README limitations)
+- Poetry and very short text: too little structure for Signal B; flagged uncertain.
+- ESL / plain human writing: both signals can read it as "uniform" -> false-positive risk.
+- Heavily AI-edited human work (and vice versa): genuinely between categories.
+
+
+=====================================================================
+PART 6 — THE FALSE-POSITIVE SCENARIO (the error we most want to prevent)
+=====================================================================
+A false positive = the system labels a HUMAN writer's work as AI-generated. On a
+writing platform this is the worst possible error: it accuses an honest creator,
+damages trust, and can affect their reputation or pay. A false negative (missing some
+AI text) is mild by comparison. Every design choice below leans away from this error.
+
+---------------------------------------------------------------------
+THE CHARACTER
+---------------------------------------------------------------------
+Maya is a real human writer. English is her second language, so her prose is clean,
+plain, and even — short, similar-length sentences, a careful and somewhat repeated
+vocabulary. She wrote a 200-word personal essay herself. Nothing about it is AI.
+This is precisely the writing both signals are biased against (see Part 5).
+
+---------------------------------------------------------------------
+TRACE THROUGH THE SYSTEM
+---------------------------------------------------------------------
+STEP 1 — Submission
+Maya POSTs her essay to /submit. It passes the rate limiter and validation, gets a
+submission id.
+
+STEP 2 — Signal A (Groq LLM)
+The model sees clean, even, plain English and leans "AI." Say it returns
+ai_likelihood = 0.74. This is the bias firing exactly as we predicted.
+
+STEP 3 — Signal B (Stylometry)
+Her sentences are uniform and her vocabulary turns over slowly, so the structural
+uniformity score is also high-ish, say 0.68 -> also leaning "AI." BUT the text is only
+~200 words, so Signal B's length guard lowers its OWN self-confidence: it is reporting
+a number it doesn't fully trust.
+
+STEP 4 — Confidence Scorer (where we protect Maya)
+Two things happen here, both deliberate:
+  (a) The signals roughly AGREE on "leaning AI" — naively that would mean high
+      confidence in an "AI" verdict. That is the trap.
+  (b) The false-positive asymmetry overrides the naive read. Because (i) the text is
+      short, (ii) Signal B flagged low self-confidence, and (iii) declaring a human's
+      work "AI" is the costliest error, the scorer REFUSES to cross into the
+      high-confidence-AI bucket on evidence this thin. It pulls the verdict DOWN into
+      "UNCERTAIN" instead. The "AI" threshold is intentionally hard to reach; the
+      borderline resolves toward not-accusing.
+Result: verdict = UNCERTAIN, not "AI." The system still got the signals "wrong," but
+the OUTPUT is honest and non-accusatory — which is the real goal, since perfect
+detection is impossible.
+
+STEP 5 — The Label Maya sees
+Because the bucket is UNCERTAIN, she gets the uncertain label variant — plain language
+that says, in effect, "we couldn't reliably tell; this is not a determination," NOT
+"this looks AI-generated." The label never accuses on weak evidence. (Exact wording is
+finalized in the README label table.)
+
+STEP 6 — Maya still disagrees -> Appeal
+Even "uncertain" can feel unfair to someone who knows she wrote it. So she appeals:
+POST /appeal with her submission id and her reasoning ("I wrote this myself; English
+is my second language"). The Appeals Handler:
+  - confirms the submission id exists in the audit log,
+  - saves her reasoning,
+  - flips the content status to "under review,"
+  - writes the appeal into the audit log right next to the original decision.
+A human reviewer can now see the original scores AND Maya's words side by side. No
+automatic re-classification — a person decides.
+
+---------------------------------------------------------------------
+WHAT THIS SCENARIO LOCKS IN FOR MILESTONE 2
+---------------------------------------------------------------------
+1. The "high-confidence AI" bucket must be HARD to reach — high threshold, and not
+   reachable on short text or when a signal reports low self-confidence.
+2. Short text and low signal self-confidence must PUSH toward "uncertain," not get
+   averaged away.
+3. The uncertain label must read as "we don't know," never as a soft accusation.
+4. Confidence is not just "how strongly the signals lean" — it must also fold in how
+   much we trust the evidence (length, agreement, per-signal self-confidence).
+5. The appeal path must always be visible/offered on any non-human verdict, so a
+   wrongly-flagged human is never stuck.
+6. Test plan must include a deliberate false-positive case (clean/plain/ESL-style short
+   text) and confirm it lands in UNCERTAIN, never high-confidence AI.
+
+
+=====================================================================
+PART 7 — THE SCORING MECHANISM (how the verdict is actually decided)
+=====================================================================
+Part 6 says WHAT happens to a misclassified human. This part says HOW the code does
+it. The verdict is produced by TWO switches. Either one alone can force "uncertain";
+both must be satisfied to make a confident claim. All numbers below are PLACEHOLDERS
+to be tuned and justified in Milestone 2.
+
+---------------------------------------------------------------------
+INPUTS THE SCORER RECEIVES
+---------------------------------------------------------------------
+From each signal, two things (not one):
+  - score: 0-1 AI-likelihood (how AI-like the signal thinks the text is).
+  - self_confidence: 0-1 (how much the signal trusts its OWN answer).
+    * Signal A (LLM): can be lowered for very short text or refusal/uncertainty.
+    * Signal B (stylometry): lowered on short text via the length guard.
+Plus: text length (word/sentence count).
+
+---------------------------------------------------------------------
+STEP 1 — COMBINE INTO ONE RAW SCORE
+---------------------------------------------------------------------
+raw_score = weighted average of the signal scores.
+  Starting point: 0.5 * signalA + 0.5 * signalB (weights revisited in Milestone 2).
+raw_score is "how AI-like, overall," on 0-1.
+
+---------------------------------------------------------------------
+SWITCH 1 — ASYMMETRIC THRESHOLDS (the "AI" bar is set HIGH on purpose)
+---------------------------------------------------------------------
+Buckets are decided by where raw_score lands, but the cutoffs are NOT symmetric:
+    raw_score >= 0.85  -> candidate: HIGH-CONFIDENCE AI
+    raw_score <= 0.35  -> candidate: HIGH-CONFIDENCE HUMAN
+    otherwise          -> UNCERTAIN
+The AI bar (0.85) is deliberately higher/harder than the human bar. Declaring a
+human's work "AI" is the costliest error, so we make "AI" expensive to claim. A score
+that merely "leans AI" (e.g., 0.71) does NOT clear the bar -> it falls to UNCERTAIN.
+
+---------------------------------------------------------------------
+SWITCH 2 — RELIABILITY GATE (do we even trust the evidence?)
+---------------------------------------------------------------------
+Separate from how hard the signals lean. Before ANY high-confidence bucket is allowed,
+the evidence must be trustworthy enough.
+    evidence_trust = function of:
+        - text length (short text lowers it),
+        - each signal's self_confidence (low self-confidence lowers it),
+        - signal agreement (signals disagreeing lowers it).
+    Rule: a HIGH-CONFIDENCE bucket is permitted ONLY IF evidence_trust >= 0.60.
+    If evidence_trust < 0.60, the verdict is forced to UNCERTAIN no matter what
+    Switch 1 said.
+
+KEY SUBTLETY: agreement earns confidence ONLY when evidence is trustworthy. Two signals
+agreeing on short, weak input is not strong evidence -- it's two unreliable guesses
+pointing the same way. We do not merely AVERAGE the signals; we GATE the result on how
+much the evidence is worth.
+
+---------------------------------------------------------------------
+FINAL VERDICT = Switch 1 AND Switch 2
+---------------------------------------------------------------------
+  HIGH-CONFIDENCE AI    : raw_score >= 0.85 AND evidence_trust >= 0.60
+  HIGH-CONFIDENCE HUMAN : raw_score <= 0.35 AND evidence_trust >= 0.60
+  UNCERTAIN             : everything else (the safe default)
+The reported confidence number shown to users/log is derived from BOTH how far
+raw_score is from the uncertain zone AND evidence_trust -- so 0.51 and 0.95 genuinely
+differ, as the rubric requires.
+
+---------------------------------------------------------------------
+MAYA RE-TRACED THROUGH THE MECHANISM (sanity check)
+---------------------------------------------------------------------
+  signalA = 0.74, signalB = 0.68  -> raw_score ~= 0.71
+  Switch 1: 0.71 < 0.85 -> does NOT qualify as high-confidence AI.
+  Switch 2: short text + Signal B low self_confidence -> evidence_trust < 0.60 ->
+            high-confidence buckets blocked anyway.
+  RESULT: UNCERTAIN (protected on BOTH switches). Matches Part 6.
+
+---------------------------------------------------------------------
+PLACEHOLDER NUMBERS TO TUNE/JUSTIFY IN MILESTONE 2
+---------------------------------------------------------------------
+  AI bar = 0.85   |   human bar = 0.35   |   evidence_trust gate = 0.60
+  signal weights = 0.5 / 0.5   |   short-text length threshold for the guard = TBD
+These are starting points. Milestone 2 must test inputs that SHOULD differ and confirm
+the cutoffs separate them sensibly (and that the deliberate false-positive case lands
+in UNCERTAIN).
+
+
+=====================================================================
+PART 8 — API SURFACE / CONTRACT (the promises code must keep)
+=====================================================================
+Vocabulary used everywhere:
+  verdict  = one of: "high_confidence_ai" | "uncertain" | "high_confidence_human"
+  confidence = float 0.0-1.0 (derived from raw_score distance + evidence_trust)
+  All timestamps = ISO-8601 UTC. All ids = short unique strings.
+
+---------------------------------------------------------------------
+1) POST /submit   — classify a piece of text   (RATE LIMITED)
+---------------------------------------------------------------------
+ACCEPTS (JSON body):
+  {
+    "text":         string   (REQUIRED; non-empty; min length enforced),
+    "content_type": string   (optional: "poem"|"essay"|"blog"|"other"; default "other"),
+    "creator_id":   string   (optional; used to scope rate limit / appeals later)
+  }
+RETURNS 200 (JSON):
+  {
+    "submission_id":      string,
+    "verdict":            "high_confidence_ai" | "uncertain" | "high_confidence_human",
+    "confidence":         float 0-1,
+    "transparency_label": string,           // the plain-language text shown to a reader
+    "raw_score":          float 0-1,        // combined AI-likelihood (inspectable)
+    "evidence_trust":     float 0-1,        // how trustworthy the evidence was
+    "signals": {
+      "llm":        { "score": float, "self_confidence": float, "reason": string },
+      "stylometry": { "score": float, "self_confidence": float,
+                      "components": { "burstiness": float, "mattr": float,
+                                      "punctuation": float } }
+    },
+    "status":    "classified",
+    "timestamp": string (ISO-8601)
+  }
+ERRORS:
+  400  missing/empty/too-short text          -> { "error": "...", "code": "bad_input" }
+  429  rate limit exceeded                    -> { "error": "...", "code": "rate_limited",
+                                                   "retry_after": int(seconds) }
+  502/503  a signal failed (e.g. Groq down)   -> degrade: either return verdict from the
+           surviving signal with LOWERED evidence_trust, OR error cleanly. (Decide in M2.)
+
+---------------------------------------------------------------------
+2) POST /appeal   — contest a classification   (RATE LIMITED)
+---------------------------------------------------------------------
+ACCEPTS (JSON body):
+  {
+    "submission_id": string (REQUIRED; must exist in the audit log),
+    "reasoning":     string (REQUIRED; the creator's own words),
+    "creator_id":    string (optional)
+  }
+RETURNS 200 (JSON):
+  {
+    "appeal_id":         string,
+    "submission_id":     string,
+    "status":            "under_review",
+    "original_verdict":  "high_confidence_ai" | "uncertain" | "high_confidence_human",
+    "original_confidence": float,
+    "appeal_reasoning":  string,
+    "timestamp":         string (ISO-8601),
+    "message":           "Your appeal has been recorded; this content is now under review."
+  }
+ERRORS:
+  400  missing reasoning                      -> { "error": "...", "code": "bad_input" }
+  404  submission_id not found                -> { "error": "...", "code": "not_found" }
+  429  rate limit exceeded                    -> { ... "code": "rate_limited" }
+
+---------------------------------------------------------------------
+3) GET /log   — read the structured audit log
+---------------------------------------------------------------------
+ACCEPTS (optional query params):
+  ?limit=N                 (cap entries returned)
+  ?submission_id=...       (filter to one submission's decision + its appeals)
+  ?type=decision|appeal    (filter by entry kind)
+RETURNS 200 (JSON):
+  {
+    "count": int,
+    "entries": [
+      // DECISION entry:
+      { "entry_id": string, "entry_type": "decision", "submission_id": string,
+        "timestamp": string, "content_excerpt": string, "verdict": string,
+        "confidence": float, "raw_score": float, "evidence_trust": float,
+        "signals": { ... same shape as /submit ... }, "transparency_label": string,
+        "status": "classified" | "under_review" },
+      // APPEAL entry (sits alongside its decision):
+      { "entry_id": string, "entry_type": "appeal", "submission_id": string,
+        "appeal_id": string, "timestamp": string, "appeal_reasoning": string,
+        "new_status": "under_review" }
+    ]
+  }
+
+---------------------------------------------------------------------
+OPTIONAL / NICE-TO-HAVE ENDPOINTS (not required by rubric)
+---------------------------------------------------------------------
+  GET /health                 -> { "status": "ok" }   (ops convenience)
+  GET /status/<submission_id> -> current status of one submission (handy for demo)
+  GET /                       -> tiny HTML form to submit text (helps the live DEMO)
+  GET /dashboard              -> reserved for the Analytics Dashboard stretch feature
+
+
+=====================================================================
+PART 9 — ARCHITECTURE DIAGRAM (both flows; arrows labeled with payloads)
+=====================================================================
+This is the diagram for planning.md's ## Architecture section. ASCII first (always
+renders); a Mermaid version follows for GitHub rendering.
+
+------------------------- ASCII: SUBMISSION FLOW -------------------------
+
+  Creator
+    |  raw text  (POST /submit)
+    v
+  +------------------------+
+  |  Flask app             |
+  |  + Flask-Limiter (gate)|---- over limit ----> 429 response (never reaches detection)
+  +------------------------+
+    |  validated text + submission_id
+    v
+  +------------------------+
+  |  Detection Pipeline    |   (orchestrator: gathers evidence, decides nothing)
+  +------------------------+
+    |                         \
+    | text                     \ text
+    v                           v
+  +------------------+     +-------------------------+
+  | Signal A: Groq   |     | Signal B: Stylometry    |
+  | LLM (semantic)   |     | (burstiness/MATTR/punct)|
+  +------------------+     +-------------------------+
+    |  scoreA + self_conf       |  scoreB + self_conf (+ components)
+    \---------------------------/
+                |  two signal results
+                v
+  +-----------------------------+
+  |  Confidence Scorer          |  raw_score = weighted avg
+  |  (Switch1 thresholds +      |  evidence_trust = f(length, self_conf, agreement)
+  |   Switch2 reliability gate) |
+  +-----------------------------+
+                |  verdict bucket + confidence
+                v
+  +-----------------------------+
+  |  Transparency Label Gen     |
+  +-----------------------------+
+                |  verdict + confidence + label text
+                v
+  +-----------------------------+
+  |  Audit Logger (SQLite/JSON) |  writes full decision record (keyed by submission_id)
+  +-----------------------------+
+                |  persisted
+                v
+        Response to Creator
+        { submission_id, verdict, confidence, transparency_label, signals, ... }
+
+--------------------------- ASCII: APPEAL FLOW ---------------------------
+
+  Creator
+    |  submission_id + reasoning  (POST /appeal)
+    v
+  +------------------------+
+  |  Flask app             |
+  |  + Flask-Limiter (gate)|
+  +------------------------+
+    |  submission_id + reasoning
+    v
+  +------------------------+      lookup original by submission_id
+  |  Appeals Handler       |--------------------------------------+
+  +------------------------+                                       |
+    |  set status = "under_review"                                 v
+    |                                                   +-----------------------+
+    |  write appeal entry (linked to original) -------> |  Audit Logger / Log   |
+    |                                                   |  (decision + appeal    |
+    |                                                   |   now sit side by side)|
+    |                                                   +-----------------------+
+    v
+  Response to Creator
+  { appeal_id, submission_id, status: "under_review", original_verdict, message }
+
+  (GET /log simply READS the Audit Log and returns decisions + appeals together.)
+
+----------------------------- MERMAID VERSION ----------------------------
+(Drop this fenced block into planning.md; GitHub renders it.)
+
+```mermaid
+flowchart TD
+  C([Creator]) -->|raw text: POST /submit| F[Flask + Rate Limiter]
+  F -->|over limit| R429[[429 response]]
+  F -->|validated text + submission_id| DP[Detection Pipeline]
+  DP -->|text| SA[Signal A: Groq LLM - semantic]
+  DP -->|text| SB[Signal B: Stylometry - structural]
+  SA -->|scoreA + self_confidence| CS[Confidence Scorer]
+  SB -->|scoreB + self_confidence| CS
+  CS -->|verdict bucket + confidence| LG[Transparency Label Generator]
+  LG -->|verdict + confidence + label text| AL[(Audit Log)]
+  AL -->|persisted record| RESP[[Response: verdict + confidence + label]]
+
+  C2([Creator]) -->|submission_id + reasoning: POST /appeal| F2[Flask + Rate Limiter]
+  F2 -->|submission_id + reasoning| AH[Appeals Handler]
+  AH -->|lookup original| AL
+  AH -->|status = under_review + write appeal entry| AL
+  AH -->|appeal_id + status under_review| RESP2[[Response]]
+  AL -->|GET /log reads| LOG[[Decisions + Appeals]]
+```
+
+
+=====================================================================
+PART 10 — DECISION: SIGNAL FAILURE HANDLING (Groq down/timeout/error)
+=====================================================================
+DECISION: Graceful degradation (Option 1), NOT a hard error.
+
+WHY
+Signal A (Groq LLM) depends on an external API and can fail: outage, timeout, rate
+cap, or junk output. Signal B (stylometry) is pure Python and always available. The
+project's theme is HONEST UNCERTAINTY, and a lost signal genuinely IS less evidence,
+which genuinely IS lower trust, which should genuinely produce "uncertain." So treating
+a dead signal as low trust is not a hack -- it is the system telling the truth about
+how much it actually knows.
+
+BEHAVIOR WHEN SIGNAL A FAILS
+  - Catch the failure (timeout / error / unparseable response). Do NOT crash the request.
+  - Run the verdict on Signal B alone.
+  - Set Signal A's contribution as: score = neutral/unused, self_confidence = 0.
+  - Force evidence_trust BELOW the reliability gate (0.60) so a single surviving signal
+    can NEVER reach a high-confidence bucket. Result is effectively always "uncertain."
+  - Record the degradation in the audit log: which signal failed and why (e.g.
+    "signal_a_status": "failed: timeout"). The log must show the verdict was made on
+    partial evidence.
+  - The transparency label for this case should read as "couldn't fully check," in the
+    uncertain family -- never an accusation built on half the evidence.
+
+SAFETY STRING (must verify in Milestone 2)
+  A single surviving signal must be STRUCTURALLY incapable of producing any
+  "high_confidence_*" verdict. Test: simulate Signal A failure on text that Signal B
+  alone would score as strongly AI -> the output MUST still be "uncertain." If it can
+  ever escape to high-confidence on one signal, the reliability gate is wired wrong.
+
+SYMMETRY NOTE
+  Same rule applies if Signal B were ever unavailable: one signal alone -> trust below
+  gate -> uncertain. No confident verdict is ever made on a single signal.
