@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Provenance Guard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --text: #e7e9ee; --muted: #9aa3b2; --accent: #6ea8fe;
+    --human: #4ade80; --uncertain: #cbd5e1; --ai: #f5b14c;
+    --danger: #f87171;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 20px 80px; }
+  header h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header p { color: var(--muted); margin: 0 0 28px; font-size: 0.95rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 20px;
+  }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+  textarea, input[type=text] {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+    font: inherit; resize: vertical;
+  }
+  textarea { min-height: 120px; }
+  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-top: 12px; }
+  .row > div { flex: 1; min-width: 160px; }
+  button {
+    background: var(--accent); color: #0b0d12; border: none; border-radius: 10px;
+    padding: 11px 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hidden { display: none; }
+
+  /* verdict pill: word + color + shape, never color alone */
+  .pill { display: inline-flex; align-items: center; gap: 8px; font-weight: 700;
+    padding: 6px 12px; border-radius: 999px; font-size: 0.9rem; border: 1px solid; }
+  .pill .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .v-likely_human { color: var(--human); border-color: var(--human); }
+  .v-likely_human .dot { background: var(--human); }
+  .v-uncertain { color: var(--uncertain); border-color: var(--uncertain); }
+  .v-uncertain .dot { background: var(--uncertain); }
+  .v-likely_ai { color: var(--ai); border-color: var(--ai); }
+  .v-likely_ai .dot { background: var(--ai); }
+
+  .label-text { font-size: 1.02rem; margin: 14px 0; }
+  .meter { height: 10px; background: var(--panel-2); border-radius: 999px; overflow: hidden; border: 1px solid var(--line); }
+  .meter > span { display: block; height: 100%; background: var(--accent); width: 0; transition: width .4s; }
+  .meta { color: var(--muted); font-size: 0.85rem; }
+  details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  code { background: var(--panel-2); padding: 1px 6px; border-radius: 6px; font-size: 0.85em; }
+  .note { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
+  .err { color: var(--danger); }
+  .ok { color: var(--human); }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Provenance Guard</h1>
+    <p>An automated estimate of whether text was written by a human or with AI help. Not proof &mdash; an honest signal with a path to appeal.</p>
+  </header>
+
+  <!-- Submit -->
+  <section class="card" aria-labelledby="submit-h">
+    <h2 id="submit-h">Check a piece of text</h2>
+    <label for="text">Text to analyze</label>
+    <textarea id="text" placeholder="Paste a paragraph, a poem, a blog excerpt&hellip;"></textarea>
+    <div class="row">
+      <div>
+        <label for="creator">Creator ID (optional)</label>
+        <input type="text" id="creator" placeholder="e.g. writer_a">
+      </div>
+      <div style="flex:0 0 auto">
+        <button id="checkBtn" onclick="submitText()">Check this text</button>
+      </div>
+    </div>
+    <p id="submitMsg" class="note" role="status" aria-live="polite"></p>
+  </section>
+
+  <!-- Result -->
+  <section class="card hidden" id="result" aria-labelledby="result-h" aria-live="polite">
+    <h2 id="result-h">Result</h2>
+    <span id="pill" class="pill"><span class="dot"></span><span id="pillText"></span></span>
+    <p class="label-text" id="labelText"></p>
+    <label for="meter" style="margin-bottom:4px">Confidence: <span id="confPct">0%</span></label>
+    <div class="meter" id="meter"><span id="meterFill"></span></div>
+    <p class="meta" id="ids" style="margin-top:12px"></p>
+
+    <details>
+      <summary>How the signals voted</summary>
+      <table>
+        <thead><tr><th>Signal</th><th>Score (AI&nbsp;likelihood)</th><th>Self-confidence</th><th>Notes</th></tr></thead>
+        <tbody id="sigRows"></tbody>
+      </table>
+      <p class="note" id="combined"></p>
+    </details>
+
+    <div class="row" style="margin-top:16px">
+      <div style="flex:0 0 auto">
+        <button class="secondary" id="appealToggle" onclick="toggleAppeal()">Appeal this result</button>
+      </div>
+    </div>
+
+    <div id="appealBox" class="hidden" style="margin-top:14px">
+      <label for="reasoning">Why do you believe this classification is wrong?</label>
+      <textarea id="reasoning" placeholder="I wrote this myself&hellip;"></textarea>
+      <div class="row">
+        <div style="flex:0 0 auto">
+          <button onclick="submitAppeal()">Submit appeal</button>
+        </div>
+      </div>
+      <p id="appealMsg" class="note" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- Audit log -->
+  <section class="card" aria-labelledby="log-h">
+    <h2 id="log-h">Audit log</h2>
+    <button class="secondary" onclick="loadLog()">Refresh log</button>
+    <div id="logBox" style="margin-top:12px"><p class="note">No entries loaded yet.</p></div>
+  </section>
+</div>
+
+<script>
+  const VERDICT_WORD = { likely_ai: "Likely AI", uncertain: "Uncertain", likely_human: "Likely human" };
+  let lastContentId = null;
+
+  async function postJSON(url, body) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) {}
+    return { status: res.status, data };
+  }
+
+  async function submitText() {
+    const text = document.getElementById("text").value.trim();
+    const creator = document.getElementById("creator").value.trim();
+    const msg = document.getElementById("submitMsg");
+    const btn = document.getElementById("checkBtn");
+    if (!text) { msg.innerHTML = '<span class="err">Please enter some text.</span>'; return; }
+
+    btn.disabled = true; msg.textContent = "Analyzing&hellip;"; msg.innerHTML = "Analyzing&hellip;";
+    try {
+      const { status, data } = await postJSON("/submit", { text, creator_id: creator || null });
+      if (status === 429) { msg.innerHTML = '<span class="err">Rate limit reached (10/min). Wait a minute and try again.</span>'; return; }
+      if (status !== 200) { msg.innerHTML = '<span class="err">' + ((data && data.error) || "Something went wrong.") + '</span>'; return; }
+      msg.textContent = "";
+      renderResult(data);
+    } catch (e) {
+      msg.innerHTML = '<span class="err">Could not reach the server. Is it running?</span>';
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderResult(d) {
+    lastContentId = d.content_id;
+    const result = document.getElementById("result");
+    result.classList.remove("hidden");
+
+    const pill = document.getElementById("pill");
+    pill.className = "pill v-" + d.attribution;
+    document.getElementById("pillText").textContent = VERDICT_WORD[d.attribution] || d.attribution;
+
+    document.getElementById("labelText").textContent = d.label;
+
+    const pct = Math.round((d.confidence || 0) * 100);
+    document.getElementById("confPct").textContent = pct + "%";
+    document.getElementById("meterFill").style.width = pct + "%";
+
+    document.getElementById("ids").innerHTML =
+      "Content ID: <code>" + d.content_id + "</code>";
+
+    const rows = document.getElementById("sigRows");
+    rows.innerHTML = "";
+    const sigs = d.signals || {};
+    addSigRow(rows, "LLM (semantic)", sigs.llm);
+    addSigRow(rows, "Stylometry (structural)", sigs.stylometry);
+    addSigRow(rows, "Phrase register (lexical)", sigs.phrase);
+    document.getElementById("combined").textContent =
+      "Combined raw score " + d.raw_score + " \u00b7 evidence trust " + d.evidence_trust;
+
+    // reset appeal UI
+    document.getElementById("appealBox").classList.add("hidden");
+    document.getElementById("appealMsg").textContent = "";
+    document.getElementById("reasoning").value = "";
+    document.getElementById("appealToggle").classList.remove("hidden");
+
+    result.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function addSigRow(tbody, name, sig) {
+    if (!sig) return;
+    const tr = document.createElement("tr");
+    const avail = sig.available;
+    let note = "unavailable";
+    if (avail) {
+      if (sig.reason) note = sig.reason;
+      else if (sig.components && sig.components.burstiness !== undefined) note = "burstiness " + sig.components.burstiness + ", mattr " + sig.components.mattr + ", punct " + sig.components.punctuation;
+      else if (sig.components && sig.components.hits !== undefined) note = sig.components.hits ? (sig.components.distinct + " cliche phrase(s): " + sig.components.matched.slice(0,4).join(", ")) : "no AI-cliche phrases found";
+      else note = "";
+    }
+    tr.innerHTML = "<td>" + name + "</td><td>" + (avail ? sig.score : "&mdash;") +
+      "</td><td>" + (avail ? sig.self_confidence : "&mdash;") + "</td><td>" + note + "</td>";
+    tbody.appendChild(tr);
+  }
+
+  function toggleAppeal() {
+    document.getElementById("appealBox").classList.toggle("hidden");
+    document.getElementById("reasoning").focus();
+  }
+
+  async function submitAppeal() {
+    const reasoning = document.getElementById("reasoning").value.trim();
+    const msg = document.getElementById("appealMsg");
+    if (!lastContentId) { msg.innerHTML = '<span class="err">No submission to appeal.</span>'; return; }
+    if (!reasoning) { msg.innerHTML = '<span class="err">Please add your reasoning.</span>'; return; }
+    try {
+      const { status, data } = await postJSON("/appeal", { content_id: lastContentId, creator_reasoning: reasoning });
+      if (status === 429) { msg.innerHTML = '<span class="err">Rate limit reached (5/min). Wait a minute.</span>'; return; }
+      if (status !== 200) { msg.innerHTML = '<span class="err">' + ((data && data.error) || "Appeal failed.") + '</span>'; return; }
+      msg.innerHTML = '<span class="ok">Appeal recorded. This content is now under review.</span>';
+      loadLog();
+    } catch (e) {
+      msg.innerHTML = '<span class="err">Could not reach the server.</span>';
+    }
+  }
+
+  async function loadLog() {
+    const box = document.getElementById("logBox");
+    box.innerHTML = '<p class="note">Loading&hellip;</p>';
+    try {
+      const res = await fetch("/log?limit=20");
+      const data = await res.json();
+      const entries = data.entries || [];
+      if (!entries.length) { box.innerHTML = '<p class="note">No entries yet.</p>'; return; }
+      let html = '<table><thead><tr><th>Type</th><th>Content ID</th><th>Attribution / status</th><th>Conf.</th><th>LLM</th><th>Sty.</th><th>Time</th></tr></thead><tbody>';
+      for (const e of entries) {
+        if (e.entry_type === "appeal") {
+          html += "<tr><td>appeal</td><td><code>" + e.content_id + "</code></td><td>" +
+            e.status + "</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>" + shortTime(e.timestamp) + "</td></tr>";
+        } else {
+          html += "<tr><td>decision</td><td><code>" + e.content_id + "</code></td><td>" +
+            e.attribution + "</td><td>" + e.confidence + "</td><td>" + e.llm_score +
+            "</td><td>" + e.stylometry_score + "</td><td>" + shortTime(e.timestamp) + "</td></tr>";
+        }
+      }
+      html += "</tbody></table>";
+      box.innerHTML = html;
+    } catch (e) {
+      box.innerHTML = '<p class="err">Could not load the log.</p>';
+    }
+  }
+
+  function shortTime(ts) { return ts ? ts.replace("T", " ").slice(0, 19) : ""; }
+</script>
+</body>
+</html>

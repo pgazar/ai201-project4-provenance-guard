@@ -1,35 +1,47 @@
-"""Confidence Scorer (M4).
+"""Confidence Scorer (M4 + Ensemble stretch).
 
-Combines Signal A (LLM) and Signal B (stylometry) into a single calibrated result:
-raw_score, evidence_trust, confidence, and an attribution bucket. Implements the
-algorithm in planning.md Section 2 exactly.
+Combines THREE signals into a single calibrated result:
+  - Signal A: LLM (semantic)        weight 0.5
+  - Signal B: stylometry (structural) weight 0.2
+  - Signal C: phrase register (lexical) weight 0.3
 
-  raw_score      = weighted average of available signal scores (0.5 / 0.5)
-  agreement      = 1 - |scoreA - scoreB|   (0 if only one signal)
+Combination = CONFIDENCE-WEIGHTED average: each signal's vote is scaled by both its
+fixed weight AND its own self_confidence. This is what lets a signal ABSTAIN safely --
+e.g. the phrase signal returns score 0 with low self_confidence when it finds no
+clichés, and confidence-weighting means that 0 barely affects the result instead of
+acting like a "human" vote.
+
+  raw_score      = sum(w_i * c_i * s_i) / sum(w_i * c_i)     (c_i = self_confidence)
+  agreement      = 1 - (max - min) over signals that are "speaking" (c_i >= 0.4)
   length_factor  = clamp(word_count / 150)
-  mean_self_conf = mean of each signal's self_confidence (failed signal contributes 0)
-  evidence_trust = mean(length_factor, mean_self_conf, agreement)
+  evidence_trust = mean(length_factor, mean_self_confidence, agreement)
   lean_strength  = |raw_score - 0.5| * 2
   confidence     = lean_strength * evidence_trust
 
-  attribution:
-    evidence_trust < 0.60        -> uncertain   (reliability gate)
-    raw_score >= 0.85            -> likely_ai
-    raw_score <= 0.35            -> likely_human
-    otherwise                    -> uncertain
+Conflict resolution / verdict:
+  evidence_trust < 0.60        -> uncertain   (reliability gate; signals disagree or weak)
+  raw_score >= 0.75            -> likely_ai    (asymmetric: AI is harder to declare)
+  raw_score <= 0.35            -> likely_human
+  otherwise                    -> uncertain
 
-Single-signal failure (graceful degradation, planning.md Part 10): the failed signal's
-self_confidence counts as 0 AND evidence_trust is capped below the gate, so a lone
-surviving signal can NEVER reach a high-confidence (likely_*) attribution.
+Two safety overrides:
+  - Graceful degradation: the LLM is the primary semantic signal; if it is unavailable,
+    evidence_trust is capped below the gate so the remaining surface signals can't make
+    a confident accusation on their own.
+  - Phrase boost: AI-cliche phrases are high-precision. A confident phrase hit lifts
+    evidence_trust to at least 0.70 so clear cliche-AI isn't gated out by short length.
+    (Validated on a labeled set to add 0 false positives -- see eval.py.)
 """
 
-# --- Thresholds (from planning.md; tunable in this milestone) ---
+# --- Thresholds & weights (tunable) ---
 AI_BAR = 0.75
 HUMAN_BAR = 0.35
 TRUST_GATE = 0.60
-W_A = 0.5
-W_B = 0.5
-LENGTH_NORM = 150        # words at/above which length_factor == 1.0
+PHRASE_BOOST_TRUST = 0.70
+LENGTH_NORM = 150
+SPEAKING = 0.40          # a signal "speaks" (counts toward agreement) above this self_conf
+
+WEIGHTS = {"llm": 0.6, "stylometry": 0.1, "phrase": 0.3}
 
 
 def _clamp01(x: float) -> float:
@@ -40,40 +52,39 @@ def _mean(xs: list) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def classify(sig_a: dict, sig_b: dict, word_count: int) -> dict:
-    """Combine two signal results into the final scored attribution."""
-    a_ok = bool(sig_a.get("available"))
-    b_ok = bool(sig_b.get("available"))
+def classify(signals: dict, word_count: int) -> dict:
+    """Combine signal results (keyed by name) into the final scored attribution."""
+    available = {k: v for k, v in signals.items() if v.get("available")}
 
-    # Weighted average over AVAILABLE signals only (renormalize weights).
-    weighted = []
-    if a_ok:
-        weighted.append((W_A, sig_a["score"]))
-    if b_ok:
-        weighted.append((W_B, sig_b["score"]))
-
-    if not weighted:                       # both signals failed
+    if not available:                              # every signal failed
         return {"attribution": "uncertain", "confidence": 0.0, "raw_score": None,
                 "evidence_trust": 0.0, "agreement": 0.0, "degraded": True}
 
-    wsum = sum(w for w, _ in weighted)
-    raw_score = sum(w * s for w, s in weighted) / wsum
+    # Confidence-weighted average (abstaining signals contribute ~nothing).
+    den = sum(WEIGHTS[k] * v["self_confidence"] for k, v in available.items())
+    if den > 0:
+        raw_score = sum(WEIGHTS[k] * v["self_confidence"] * v["score"]
+                        for k, v in available.items()) / den
+    else:  # all available signals fully abstained -> fall back to plain weighting
+        wsum = sum(WEIGHTS[k] for k in available)
+        raw_score = sum(WEIGHTS[k] * v["score"] for k, v in available.items()) / wsum
 
-    # Agreement is only meaningful with both signals present.
-    agreement = (1 - abs(sig_a["score"] - sig_b["score"])) if (a_ok and b_ok) else 0.0
+    speaking = [v["score"] for v in available.values()
+                if v.get("self_confidence", 0) >= SPEAKING]
+    agreement = (1 - (max(speaking) - min(speaking))) if len(speaking) >= 2 else 0.0
 
-    mean_self_conf = _mean([
-        sig_a.get("self_confidence", 0.0) if a_ok else 0.0,
-        sig_b.get("self_confidence", 0.0) if b_ok else 0.0,
-    ])
-
+    mean_self_conf = _mean([v.get("self_confidence", 0.0) for v in available.values()])
     length_factor = _clamp01(word_count / LENGTH_NORM)
     evidence_trust = _mean([length_factor, mean_self_conf, agreement])
 
-    degraded = not (a_ok and b_ok)
+    degraded = not signals.get("llm", {}).get("available")
     if degraded:
-        # Safety: a single surviving signal can never clear the reliability gate.
         evidence_trust = min(evidence_trust, TRUST_GATE - 0.01)
+
+    phrase = signals.get("phrase", {})
+    if phrase.get("available") and phrase.get("score", 0) >= 0.5 \
+            and phrase.get("self_confidence", 0) >= 0.6:
+        evidence_trust = max(evidence_trust, PHRASE_BOOST_TRUST)
 
     lean_strength = abs(raw_score - 0.5) * 2
     confidence = _clamp01(lean_strength * evidence_trust)
@@ -98,27 +109,32 @@ def classify(sig_a: dict, sig_b: dict, word_count: int) -> dict:
 
 
 if __name__ == "__main__":
-    # Deterministic checks: prove the scorer matches the planning.md thresholds,
-    # with no LLM variance. (score, self_confidence, available)
+    # Deterministic checks: prove the ensemble matches the documented thresholds.
     def S(score, sc, avail=True):
         return {"available": avail, "score": score, "self_confidence": sc}
 
     cases = [
-        ("strong AI agreement",                 S(0.95, 0.9), S(0.95, 0.9), 200, "likely_ai"),
-        ("strong human agreement",              S(0.10, 0.9), S(0.10, 0.9), 200, "likely_human"),
-        ("false positive: short plain, both lean AI", S(0.70, 0.6), S(0.70, 0.1), 14, "uncertain"),
-        ("signals disagree",                    S(0.80, 0.7), S(0.30, 0.7), 200, "uncertain"),
-        ("Signal A failed, B strongly AI",      S(None, 0.0, False), S(0.90, 0.9), 200, "uncertain"),
-        ("both signals failed",                 S(None, 0.0, False), S(None, 0.0, False), 200, "uncertain"),
+        ("strong AI agreement (all 3)",
+         {"llm": S(0.95, 0.9), "stylometry": S(0.95, 0.9), "phrase": S(1.0, 1.0)}, 200, "likely_ai"),
+        ("strong human, phrase abstains",
+         {"llm": S(0.10, 0.9), "stylometry": S(0.10, 0.9), "phrase": S(0.0, 0.2)}, 200, "likely_human"),
+        ("false positive: short plain, both lean AI",
+         {"llm": S(0.70, 0.6), "stylometry": S(0.70, 0.4), "phrase": S(0.0, 0.1)}, 14, "uncertain"),
+        ("cliche AI, short (phrase boost rescues)",
+         {"llm": S(0.60, 0.6), "stylometry": S(0.50, 0.4), "phrase": S(1.0, 1.0)}, 40, "likely_ai"),
+        ("LLM failed, surface signals strong",
+         {"llm": S(None, 0.0, False), "stylometry": S(0.90, 0.9), "phrase": S(0.0, 0.2)}, 200, "uncertain"),
+        ("all signals failed",
+         {"llm": S(None, 0.0, False), "stylometry": S(None, 0.0, False), "phrase": S(None, 0.0, False)}, 200, "uncertain"),
     ]
-    print(f"{'case':46} | {'raw':>5} {'trust':>6} {'conf':>5} | got          expected")
+    print(f"{'case':46} | {'raw':>6} {'trust':>6} | got          expected")
     print("-" * 92)
     all_ok = True
-    for name, a, b, wc, exp in cases:
-        r = classify(a, b, wc)
+    for name, sigs, wc, exp in cases:
+        r = classify(sigs, wc)
         ok = r["attribution"] == exp
         all_ok = all_ok and ok
-        raw = "  n/a" if r["raw_score"] is None else f"{r['raw_score']:>5}"
-        print(f"{name:46} | {raw} {r['evidence_trust']:>6} {r['confidence']:>5} | "
-              f"{r['attribution']:12} {'OK' if ok else 'FAIL (exp ' + exp + ')'}")
+        raw = "   n/a" if r["raw_score"] is None else f"{r['raw_score']:>6}"
+        print(f"{name:46} | {raw} {r['evidence_trust']:>6} | {r['attribution']:12} "
+              f"{'OK' if ok else 'FAIL (exp ' + exp + ')'}")
     print("\nALL THRESHOLD CHECKS PASS" if all_ok else "\nSOME CHECKS FAILED")

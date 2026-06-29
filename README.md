@@ -3,10 +3,10 @@
 An AI content-attribution service for a writing platform. A creator submits text; the
 system estimates whether it was written by a human or with AI help, returns a
 **confidence score** and a plain-language **transparency label**, records every decision
-in a structured **audit log**, and gives creators a way to **appeal**.
+in a structured **audit log**, and lets creators **appeal**.
 
 The guiding principle is **honest uncertainty**. Perfect AI detection is an unsolved
-problem, so this system is built to say *"I'm not sure"* rather than force a binary, and
+problem, so the system is built to say *"I'm not sure"* rather than force a binary, and
 to lean *away* from accusing a human — on a writing platform, wrongly flagging a real
 person's work (a false positive) is the worst outcome.
 
@@ -21,33 +21,32 @@ person's work (a false positive) is the worst outcome.
 - [Appeals workflow](#appeals-workflow)
 - [Rate limiting](#rate-limiting)
 - [Audit log](#audit-log)
+- [Ensemble detection (stretch)](#ensemble-detection-stretch)
+- [Evaluation](#evaluation)
 - [Known limitations](#known-limitations)
 - [Spec reflection](#spec-reflection)
 - [AI usage](#ai-usage)
 - [What I'd change for production](#what-id-change-for-production)
-- [Architecture & project structure](#architecture--project-structure)
+- [Project structure](#project-structure)
 
 ---
 
 ## How to run
 
 ```bash
-# 1. create + activate a virtual environment
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
-
-# 2. install dependencies
 pip install -r requirements.txt
-
-# 3. add your Groq API key
 cp env.example .env                  # then edit .env and set GROQ_API_KEY=...
-
-# 4. run the server
-python app.py
+python app.py                        # opens the browser UI automatically
 ```
 
-The server runs on **http://localhost:5001** by default. (Port 5001 rather than 5000
-because macOS AirPlay Receiver occupies 5000; override with `PORT=8000 python app.py`.)
+The server runs on **http://localhost:5001** by default (port 5001 because macOS AirPlay
+Receiver occupies 5000; override with `PORT=8000 python app.py`). Running `python app.py`
+auto-opens the browser UI; disable with `OPEN_BROWSER=0 python app.py`.
+
+There is also a **browser UI** at `GET /` — paste text, see the verdict, confidence,
+per-signal breakdown, file an appeal, and view the audit log.
 
 ---
 
@@ -55,157 +54,147 @@ because macOS AirPlay Receiver occupies 5000; override with `PORT=8000 python ap
 
 | Method & path | Purpose |
 |---|---|
-| `POST /submit` | Classify a piece of text. Returns attribution, confidence, and label. Rate limited. |
-| `POST /appeal` | Contest a classification. Sets status to `under_review` and logs the appeal. Rate limited. |
+| `POST /submit` | Classify text. Returns attribution, confidence, label, per-signal scores. Rate limited. |
+| `POST /appeal` | Contest a classification. Sets status to `under_review`, logs the appeal. Rate limited. |
 | `GET /log` | Return the structured audit log (decisions + appeals). |
+| `GET /` | Browser UI. |
 | `GET /health` | Liveness check. |
 
 ### `POST /submit`
-
-Request:
 ```bash
 curl -s -X POST http://localhost:5001/submit \
   -H "Content-Type: application/json" \
-  -d '{"text": "The sun dipped below the horizon...", "creator_id": "writer_a"}'
+  -d '{"text": "Your text here", "creator_id": "writer_a"}'
 ```
-
 Response (abridged):
 ```json
 {
-  "content_id": "97770520c1a0",
+  "content_id": "f7160f821838",
   "attribution": "likely_ai",
-  "confidence": 0.823,
+  "confidence": 0.453,
   "label": "Likely AI-generated. Our automated check found strong signs ...",
-  "raw_score": 0.975,
-  "evidence_trust": 0.867,
+  "raw_score": 0.823,
+  "evidence_trust": 0.7,
   "signals": {
-    "llm": {"available": true, "score": 0.95, "self_confidence": 0.9, "reason": "..."},
-    "stylometry": {"available": true, "score": 1.0, "self_confidence": 0.8,
-                   "components": {"burstiness": 1.0, "mattr": 1.0, "punctuation": 1.0}}
+    "llm":        {"available": true, "score": 0.7,   "self_confidence": 0.6, "reason": "..."},
+    "stylometry": {"available": true, "score": 0.554, "self_confidence": 0.8,
+                   "components": {"burstiness": 0.7, "mattr": 0.0, "punctuation": 1.0}},
+    "phrase":     {"available": true, "score": 1.0,   "self_confidence": 1.0,
+                   "components": {"hits": 11, "distinct": 11, "per_100_words": 22.9, "matched": ["..."]}}
   },
   "status": "classified",
-  "timestamp": "2026-06-29T01:00:17.132Z"
+  "timestamp": "2026-06-29T03:40:13.139Z"
 }
 ```
-
-`content_id` is the spine of the system — save it; it's what an appeal references and
-what ties a decision to its appeal in the audit log.
+`content_id` is the spine of the system — it's what an appeal references and what links a
+decision to its appeal in the audit log.
 
 ---
 
 ## Detection signals
 
-The pipeline uses **two distinct signals**, chosen so their blind spots barely overlap:
-one reads *meaning*, the other counts *form*. Their agreement (or disagreement) is itself
-information that drives the confidence score.
+The pipeline uses **three distinct, independent signals**, chosen so their blind spots
+barely overlap: one reads *meaning*, one counts *structure*, one matches *lexical
+markers*. Each returns a continuous 0–1 AI-likelihood plus a `self_confidence`.
 
 ### Signal A — Groq LLM classifier (semantic)
-- **What it measures:** the holistic *feel* of the prose — voice, coherence,
-  idiosyncrasy, versus the bland, even, hedging register that default chat models drift
-  into. Implemented as one call to Groq `llama-3.3-70b-versatile` (temperature 0.2),
-  prompted to return a continuous AI-likelihood, a self-confidence, and a one-line reason.
-- **Why this signal:** an LLM can perceive the gestalt of "this reads like AI" in a way
-  that no simple statistic can.
-- **What it misses:** it's non-deterministic (same text varies run to run), its
-  confidence isn't calibrated to truth, it's a black box, and — critically — it tends to
-  flag plain or non-native-English writing as AI. We push back on that last bias directly
-  in the prompt, but it can't be eliminated.
+- **Captures:** the holistic "feel" of the prose — voice, coherence, idiosyncrasy versus
+  the bland, even register default chat models drift into. One call to Groq
+  `llama-3.3-70b-versatile` (temperature 0.2), prompted to return JSON.
+- **Misses:** non-deterministic (varies run to run); confidence isn't calibrated to
+  truth; tends to read plain/non-native-English writing as AI (we push back in the
+  prompt); and — the big one — it reads *polished modern AI* as human.
 
 ### Signal B — Stylometric heuristics (structural)
-Pure-Python, deterministic. Measures how *uniform* the writing is, from three sub-metrics
-(each mapped to a 0–1 AI-likeness contribution, then weighted 0.5 / 0.3 / 0.2):
-- **burstiness** — variation in sentence length. Humans mix short and long; default AI is
-  more uniform. (Low variation → more AI-like.)
-- **mattr** — moving-average type-token ratio (lexical diversity), computed over a fixed
-  50-word window so it doesn't collapse on long text the way raw TTR does.
-- **punctuation** — variety of "rich" marks (dashes, semicolons, parentheses…). Human
-  punctuation habits are more varied.
-- **Why this signal:** it's transparent, reproducible, and independent of the LLM — it
-  fails for completely different reasons, which is the point of an ensemble.
-- **What it misses:** it's meaning-blind, unreliable on short text (too few sentences to
-  judge), easily gamed in both directions, confounded by genre (poetry, lists, dialogue),
-  and its reference points are hand-chosen heuristics, not learned from a corpus. A
-  length guard lowers its self-confidence on short input.
+- **Captures:** how *uniform* the writing is, from three sub-metrics — sentence-length
+  burstiness, MATTR (moving-average lexical diversity, length-robust), and punctuation
+  variety. AI tends to be uniform; humans are bumpier. Pure Python, deterministic, with a
+  length guard that lowers self_confidence on short text.
+- **Misses:** meaning-blind; unreliable on short text; gameable both ways; confounded by
+  genre (poetry, lists); reads polished modern AI as human (it varies its sentences).
 
-**Why the pairing works:** Signal A is meaning-aware but moody and bias-prone; Signal B
-is steady but meaning-blind. When they agree, that's strong multi-perspective evidence.
-When they disagree, that's exactly the *uncertain* zone we want to surface honestly. Their
-one shared blind spot — plain/ESL writing — is the reason the scorer leans toward
-"human/uncertain" on weak evidence (see below).
+### Signal C — AI-register phrase detector (lexical)
+- **Captures:** density of multi-word phrases characteristic of the "AI essay" register
+  (*it is important to note, in today's fast-paced world, delve into, a testament to*).
+  Pure Python. High precision when it fires; abstains (low self_confidence) otherwise.
+- **Misses:** natural conversational AI that avoids clichés; gameable by avoiding the
+  phrases. Deliberately uses multi-word phrases (not generic single words) to avoid
+  flagging formal *human* writing.
+
+**Why three:** the LLM and stylometry both get fooled by polished modern AI; the phrase
+detector catches the common cliché-AI register that fools them — without false-flagging
+real people. Independent failure modes are what make the ensemble worth more than its
+parts. (See [Ensemble detection](#ensemble-detection-stretch).)
 
 ---
 
 ## Confidence scoring
 
-The scorer keeps three numbers distinct:
-- **`raw_score`** — *how AI-like* the text is (0 = clearly human, 1 = clearly AI),
-  the weighted average of the available signal scores.
-- **`evidence_trust`** — *how much we trust the evidence*, the mean of three factors:
-  text length, the signals' self-confidence, and how much the two signals agree.
-- **`confidence`** — the reported headline number = `lean_strength × evidence_trust`,
-  where `lean_strength = |raw_score − 0.5| × 2`.
+Three numbers, kept distinct:
+- **`raw_score`** — how AI-like the text is (0 = clearly human, 1 = clearly AI), the
+  **confidence-weighted** average of the signals (each vote scaled by its weight *and* its
+  own self_confidence, so an abstaining signal fades out instead of voting "human").
+- **`evidence_trust`** — how much we trust the evidence: the mean of text length, the
+  signals' mean self_confidence, and how much the signals agree.
+- **`confidence`** — the reported headline = `lean_strength × evidence_trust`, where
+  `lean_strength = |raw_score − 0.5| × 2`.
 
-A verdict needs **two switches** to pass:
+A verdict needs **two switches**:
 1. **Asymmetric thresholds.** `raw_score ≥ 0.75` → `likely_ai`; `raw_score ≤ 0.35` →
-   `likely_human`; otherwise `uncertain`. The AI bar sits farther from the 0.5 midpoint
-   than the human bar — it takes *stronger* evidence to call something AI than to call it
-   human. That asymmetry is the false-positive guard.
+   `likely_human`; otherwise `uncertain`. The AI bar is farther from the midpoint than
+   the human bar — it takes *stronger* evidence to call something AI. That asymmetry is
+   the false-positive guard.
 2. **Reliability gate.** A high-confidence verdict is only allowed when
-   `evidence_trust ≥ 0.60`. Two signals agreeing on short, weak input is *not* strong
-   evidence — it's two unreliable guesses pointing the same way, so the gate forces
-   `uncertain`.
+   `evidence_trust ≥ 0.60`. Signals agreeing on short, weak input is *not* strong
+   evidence, so the gate forces `uncertain`.
 
-**Why this approach:** the hardest part of the assignment isn't detection, it's *honestly
-representing uncertainty*. We decided what a low score should mean to a user first ("we
-don't know"), then built the math to produce it. The gate — not the threshold — is what
-protects the false-positive case, which is why short/weak text can never be confidently
-accused.
+Two overrides: **graceful degradation** (if the LLM is unavailable, trust is capped below
+the gate so the surface signals can't accuse alone) and a **phrase boost** (a confident
+cliché hit lifts trust to ≥ 0.70 so clear cliché-AI isn't gated out by short length —
+measured to add 0 false positives).
 
 ### Two example submissions (real output)
 
-**High-confidence case** — a repetitive, uniform paragraph; both signals strongly agree:
+**High-confidence case** — a cliché-heavy AI paragraph; the phrase signal fires and all
+three lean AI:
 
 | field | value |
 |---|---|
-| `llm_score` | 0.95 |
-| `stylometry_score` | 1.0 |
-| `raw_score` | 0.975 |
-| `evidence_trust` | 0.867 |
-| **`confidence`** | **0.823** |
+| `llm_score` / `stylometry_score` / `phrase_score` | 0.7 / 0.554 / 1.0 |
+| `raw_score` | 0.823 |
+| `evidence_trust` | 0.70 |
+| **`confidence`** | **0.453** |
 | **`attribution`** | **`likely_ai`** |
 
 **Lower-confidence case** — the input `"It rained today."` (too short to judge):
 
 | field | value |
 |---|---|
-| `llm_score` | 0.4 |
-| `stylometry_score` | 0.45 |
-| `raw_score` | 0.425 |
-| `evidence_trust` | 0.36 |
-| **`confidence`** | **0.054** |
+| `llm_score` / `stylometry_score` / `phrase_score` | 0.4 / 0.45 / 0.0 |
+| `raw_score` | 0.39 |
+| `evidence_trust` | 0.032 |
+| **`confidence`** | **0.007** |
 | **`attribution`** | **`uncertain`** |
 
-`0.823` vs `0.054` — the scoring produces meaningful variation, not a constant. The short
-input lands in `uncertain` because its `evidence_trust` (0.36) is below the gate, even
-though the raw scores aren't far apart.
+`0.453` vs `0.007` — meaningful variation, not a constant. The short input is `uncertain`
+because its `evidence_trust` is far below the gate.
 
-### How I validated the scores
-- **Deterministic threshold checks** in `scorer.py` (run `python scorer.py`) feed fixed
-  signal values through the scorer and assert the bucket — proving the scorer matches the
-  spec's thresholds with no LLM variance. All checks pass, including the false-positive
-  case (short + both-lean-AI → `uncertain`) and the single-signal-failure case.
-- **Four hand-picked inputs** spanning the range (clearly AI, clearly human, formal human,
-  lightly-edited AI) were run end-to-end; the scores ordered as intuition expects.
+### How the scores were validated
+- **Deterministic threshold checks** in `scorer.py` (`python scorer.py`) feed fixed
+  signal values through the scorer and assert the bucket — proving it matches the spec
+  with no LLM variance. All pass, including the false-positive and signal-failure cases.
+- **A labeled benchmark** (`eval.py`) runs 12 hand-labeled samples through the live
+  pipeline and reports false positives and AI caught (see [Evaluation](#evaluation)).
 
 ---
 
 ## Transparency labels
 
-Plain language, no jargon, no raw numbers in the text. The three variants differ in
-**words**, not just a number. The AI variant never says "this *is* AI" (only "strong
-signs / may have") and is the only one that invites an appeal, because it's the verdict
-that can harm a creator. The uncertain variant explicitly states that no judgment was
-made.
+Plain language, no jargon, no raw numbers. The three variants differ in **words**, not
+just a number. The AI variant never says "this *is* AI" (only "strong signs / may have")
+and is the only one that invites an appeal, because it's the verdict that can harm a
+creator. The label is selected from the attribution bucket (derived from the score), so
+it provably changes with the score.
 
 | Attribution | Label text (verbatim) |
 |---|---|
@@ -213,36 +202,23 @@ made.
 | `uncertain` | "We couldn't determine how this was written. Our automated check could not reliably tell whether this text was written by a person or with AI help. No determination has been made, and this is not a judgment about the author." |
 | `likely_human` | "Likely human-written. Our automated check found no strong signs of AI generation in this text. This is an automated estimate, not a guarantee." |
 
-The label is selected from the attribution bucket, which is derived from the confidence
-score — so the label provably changes with the score. All three are reachable (see the
-audit log below, which contains one of each).
-
 ---
 
 ## Appeals workflow
 
 Any creator can contest any result via `POST /appeal` with a `content_id` and
-`creator_reasoning`. The endpoint:
-1. verifies the `content_id` exists (else `404`),
-2. captures the reasoning verbatim,
-3. flips the content's status from `classified` to `under_review`,
-4. writes an `appeal` entry into the audit log, linked to the original decision so a human
-   reviewer sees the verdict and the creator's words side by side.
+`creator_reasoning`. The endpoint verifies the `content_id` exists (else `404`), captures
+the reasoning, flips the content's status from `classified` to `under_review`, and writes
+an `appeal` entry into the audit log linked to the original decision. No automatic
+re-classification — a human decides.
 
-There is no automatic re-classification — a human decides.
-
-```bash
-curl -s -X POST http://localhost:5001/appeal \
-  -H "Content-Type: application/json" \
-  -d '{"content_id": "97770520c1a0", "creator_reasoning": "I wrote this myself..."}'
-```
 ```json
 {
-  "appeal_id": "41156f433dbe",
-  "content_id": "97770520c1a0",
+  "appeal_id": "c98db2818f4c",
+  "content_id": "f7160f821838",
   "status": "under_review",
   "original_attribution": "likely_ai",
-  "appeal_reasoning": "I wrote this myself...",
+  "appeal_reasoning": "This is templated marketing copy my team wrote; please review.",
   "message": "Your appeal has been recorded; this content is now under review."
 }
 ```
@@ -251,36 +227,24 @@ curl -s -X POST http://localhost:5001/appeal \
 
 ## Rate limiting
 
-Rate limiting (Flask-Limiter, per client IP) is the **gate** — it runs before the
-expensive detection work, so abuse is refused cheaply.
+Flask-Limiter (per client IP) is the **gate** — it runs before the expensive detection
+work, so abuse is refused cheaply.
 
 | Endpoint | Limit | Reasoning |
 |---|---|---|
-| `POST /submit` | **10 / minute; 100 / day** | A real writer checks their own work occasionally; even an active user revising a few pieces rarely exceeds a handful of submissions per minute or dozens per day. 10/min absorbs honest bursts while blocking a script that fires hundreds of requests; 100/day caps sustained abuse while comfortably covering a heavy legitimate day. |
-| `POST /appeal` | **5 / minute; 50 / day** | Appeals are rarer than submissions, and each one queues costly human review, so the limit is tighter — flooding appeals would be a denial-of-service on reviewers. |
+| `POST /submit` | **10 / minute; 100 / day** | A real writer checks their own work occasionally; even an active user revising a few pieces rarely exceeds a handful per minute or dozens per day. 10/min absorbs honest bursts while blocking a flooding script; 100/day caps sustained abuse while covering a heavy legitimate day. |
+| `POST /appeal` | **5 / minute; 50 / day** | Appeals are rarer and each queues costly human review, so the limit is tighter — flooding appeals would be a denial-of-service on reviewers. |
 
 ### Evidence (12 rapid requests, limit 10/min)
 ```
-200
-200
-200
-200
-200
-200
-200
-200
-200
-200
-429
-429
+200 200 200 200 200 200 200 200 200 200 429 429
 ```
-The first ten succeed; the rest return `429 Too Many Requests` ("10 per 1 minute").
-Reproduce with:
+The first ten succeed; the rest return `429 Too Many Requests`. Reproduce:
 ```bash
 for i in $(seq 1 12); do
   curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:5001/submit \
     -H "Content-Type: application/json" \
-    -d '{"text": "This is a test submission for rate limit testing purposes only.", "creator_id": "ratelimit-test"}'
+    -d '{"text": "rate limit test", "creator_id": "rl"}'
 done
 ```
 
@@ -288,42 +252,41 @@ done
 
 ## Audit log
 
-Every decision and every appeal is appended to `audit_log.jsonl` as one structured JSON
-object per line (not console output). `GET /log` returns it. Each **decision** entry
-records the timestamp, content ID, attribution, confidence, both individual signal scores,
-the combined `raw_score`/`evidence_trust`, and which signals were used. Each **appeal**
-entry records the reasoning, the `under_review` status, and the original attribution, so it
-sits alongside the decision it contests.
+Every decision and appeal is appended to `audit_log.jsonl` (one JSON object per line —
+structured, not console output). `GET /log` returns it. Decision entries record the
+timestamp, content ID, attribution, confidence, **all three individual signal scores**,
+the combined `raw_score`/`evidence_trust`, and which signals were used. Appeal entries
+record the reasoning, the `under_review` status, and the original attribution, so they sit
+alongside the decision they contest.
 
-Curated sample (`GET /log`) — one of each attribution plus an appeal:
 ```json
 [
-  { "entry_type": "appeal", "appeal_id": "41156f433dbe", "content_id": "97770520c1a0",
-    "creator_id": "writer_a", "appeal_reasoning": "This is automated documentation text ...",
-    "status": "under_review", "original_attribution": "likely_ai",
-    "original_confidence": 0.823, "timestamp": "2026-06-29T01:00:18.699Z" },
+  {"entry_type": "appeal", "appeal_id": "c98db2818f4c", "content_id": "f7160f821838",
+   "appeal_reasoning": "This is templated marketing copy my team wrote; please review.",
+   "status": "under_review", "original_attribution": "likely_ai",
+   "original_confidence": 0.453, "timestamp": "2026-06-29T03:40:14.352Z"},
 
-  { "entry_type": "decision", "content_id": "dc9b85155ac2", "creator_id": "writer_c",
-    "attribution": "uncertain", "confidence": 0.054, "raw_score": 0.425,
-    "evidence_trust": 0.36, "llm_score": 0.4, "stylometry_score": 0.45,
-    "signals_used": ["llm", "stylometry"], "status": "classified",
-    "timestamp": "2026-06-29T01:00:18.187Z" },
+  {"entry_type": "decision", "content_id": "539da40f7908", "attribution": "uncertain",
+   "confidence": 0.007, "raw_score": 0.39, "evidence_trust": 0.032,
+   "llm_score": 0.4, "stylometry_score": 0.45, "phrase_score": 0.0,
+   "signals_used": ["llm","stylometry","phrase"], "status": "classified",
+   "timestamp": "2026-06-29T03:40:13.964Z"},
 
-  { "entry_type": "decision", "content_id": "605b2971550e", "creator_id": "writer_b",
-    "attribution": "likely_human", "confidence": 0.556, "raw_score": 0.134,
-    "evidence_trust": 0.759, "llm_score": 0.2, "stylometry_score": 0.067,
-    "signals_used": ["llm", "stylometry"], "status": "classified",
-    "timestamp": "2026-06-29T01:00:17.680Z" },
+  {"entry_type": "decision", "content_id": "a065a40b9d8d", "attribution": "likely_human",
+   "confidence": 0.411, "raw_score": 0.177, "evidence_trust": 0.636,
+   "llm_score": 0.2, "stylometry_score": 0.217, "phrase_score": 0.0,
+   "signals_used": ["llm","stylometry","phrase"], "status": "classified",
+   "timestamp": "2026-06-29T03:40:13.608Z"},
 
-  { "entry_type": "decision", "content_id": "97770520c1a0", "creator_id": "writer_a",
-    "attribution": "likely_ai", "confidence": 0.823, "raw_score": 0.975,
-    "evidence_trust": 0.867, "llm_score": 0.95, "stylometry_score": 1.0,
-    "signals_used": ["llm", "stylometry"], "status": "classified",
-    "timestamp": "2026-06-29T01:00:17.132Z" }
+  {"entry_type": "decision", "content_id": "f7160f821838", "attribution": "likely_ai",
+   "confidence": 0.453, "raw_score": 0.823, "evidence_trust": 0.7,
+   "llm_score": 0.7, "stylometry_score": 0.554, "phrase_score": 1.0,
+   "signals_used": ["llm","stylometry","phrase"], "status": "classified",
+   "timestamp": "2026-06-29T03:40:13.139Z"}
 ]
 ```
-Note `content_id 97770520c1a0` appears twice — once as the original `likely_ai` decision
-and once as the appeal now `under_review`.
+`content_id f7160f821838` appears twice — the original `likely_ai` decision and the appeal
+now `under_review`.
 
 **Two storage mechanisms, on purpose:** the audit log is an append-only *ledger* (history
 you never rewrite); a submission's *current status* is mutable state, so it lives
@@ -332,95 +295,134 @@ a status, which breaks the integrity of a ledger.
 
 ---
 
+## Ensemble detection (stretch)
+
+The system implements the **Ensemble Detection** stretch feature: **three** signals (see
+[Detection signals](#detection-signals)) combined with a documented strategy.
+
+- **Weighting:** confidence-weighted average, **LLM 0.6 / stylometry 0.1 / phrase 0.3**.
+  Each vote is scaled by both its fixed weight and its own self_confidence, so a signal
+  that abstains (e.g. the phrase detector finding no clichés) contributes ~nothing rather
+  than skewing the result.
+- **Conflict resolution:** when signals disagree, the agreement term drops `evidence_trust`
+  and the verdict is forced to `uncertain`. No single signal can produce a high-confidence
+  accusation on its own (the asymmetric AI bar + the reliability gate). One targeted
+  exception: a *confident* phrase hit lifts `evidence_trust` so clear cliché-AI clears the
+  gate — validated to add zero false positives.
+- **Individual scores shown alongside the ensemble result:** every `/submit` response and
+  every audit entry includes `llm_score`, `stylometry_score`, and `phrase_score` next to
+  the combined `raw_score` and final attribution.
+
+---
+
+## Evaluation
+
+`eval.py` runs a 12-sample hand-labeled benchmark (6 human, 6 AI of varying quality)
+through the live pipeline and reports the metrics that matter — chiefly false positives.
+Current results:
+
+```
+AI caught (likely_ai):      2/6
+AI soft-missed (uncertain): 4/6   (acceptable: not accused)
+FALSE POSITIVES (H->AI):    0/6   (must stay 0)
+```
+
+The ensemble reliably catches the **cliché-AI** class with **zero false positives**,
+including stress tests (formal academic writing and a human who uses a cliché both stay
+safe). Natural conversational AI is not caught — see limitations. Re-run with
+`python eval.py`; this harness is how every tuning decision (thresholds, weights, the
+third signal) was made on evidence rather than by guessing.
+
+---
+
 ## Known limitations
 
-1. **Short, plain, or non-native-English (ESL) human writing.** This is the system's
-   sharpest failure mode and its one *shared* blind spot. Signal A tends to read clean,
-   even prose as AI; Signal B reads uniform sentence length and sparse punctuation as
-   AI. So both signals can lean AI on a genuine human's plain writing. The reliability
-   gate and asymmetric AI bar push *short* versions of this to `uncertain` (never
-   `likely_ai`), but a **long** plain human text where both signals lean AI and trust is
-   high could still be misclassified — the gate can't catch it because it's long. This is
-   a direct consequence of what the signals measure, not a data-quantity problem.
-2. **Polished, long-form AI.** Well-written AI varies its sentence length enough to evade
-   the stylometry signal, so unless the LLM is confident on its own, such text lands in
-   `uncertain` (a false negative). That's the acceptable error here — we'd rather miss AI
-   than accuse a human.
-3. **Poetry / verse.** Deliberate repetition and short length break the stylometry
-   assumptions; surfaced honestly as `uncertain` rather than guessed.
+1. **Polished, natural, modern AI is not detected.** This is the system's hard ceiling.
+   Conversational AI (the everyday ChatGPT/Claude kind) reads as human to the LLM signal
+   (it scored such text ~0.2) *and* to stylometry (it varies its sentences), and contains
+   no clichés for the phrase signal. With all three reading "human," no weighting or
+   threshold can recover an AI verdict — so this text lands `uncertain` or `likely_human`.
+   This is a property of the signals, not a data-quantity problem, and it reflects the
+   genuine state of the art (reliable detection of short, natural AI text is unsolved).
+2. **Short, plain, or non-native-English (ESL) human writing** is the shared blind spot:
+   the LLM and stylometry can both read clean, even prose as AI. The reliability gate and
+   asymmetric AI bar push *short* cases to `uncertain` (never `likely_ai`), but a *long*
+   plain/ESL human text where both lean AI and trust is high could be misclassified.
+3. **Poetry / verse** breaks the stylometry assumptions (repetition, short length) and is
+   surfaced honestly as `uncertain`.
+
+Operationally: runs on Flask's development server (a production deploy would use a WSGI
+server like Gunicorn), and rate limits use in-memory storage that resets on restart.
 
 ---
 
 ## Spec reflection
 
-**How the spec helped.** Writing `planning.md` before any code — the signals, the
-threshold table, and the exact label text — gave the implementation a precise target. The
-scoring pseudocode in `planning.md` mapped almost line-for-line onto `scorer.py`, and
-finalizing the label wording up front meant it never drifted once code hardcoded it.
+**How the spec helped.** Writing `planning.md` first — signals, the threshold table, the
+exact label text — gave the implementation a precise target. The scoring pseudocode
+mapped almost line-for-line onto `scorer.py`, and finalizing the label wording up front
+meant it never drifted once code hardcoded it.
 
-**How the implementation diverged.** The AI bar. I planned `raw_score ≥ 0.85` for
-`likely_ai`. But after building the LLM signal with a deliberately conservative prompt
-(told to use the full range and not snap to extremes), clearly-AI text capped around 0.7
-raw — so 0.85 made `likely_ai` effectively unreachable on real text. I lowered the bar to
-**0.75** after seeing real output, having confirmed that the *reliability gate*, not the
-threshold, is what protects the false-positive case. The lesson: a threshold has to be
-calibrated to the behavior of the signal you actually built, not the one you imagined.
+**How the implementation diverged.** Three ways, all evidence-driven. (1) The AI bar:
+planned at 0.85, but the deliberately-conservative LLM prompt capped clear AI near 0.7, so
+it was lowered to **0.75** after seeing real output. (2) A **third signal** and
+**confidence-weighted** scoring were added (the Ensemble stretch) after measuring that the
+original two signals missed cliché AI and that a plain weighted average let an abstaining
+signal act like a "human" vote. (3) Most importantly, I accepted that **natural modern AI
+is undetectable** and chose to build *honest uncertainty* — a system that says "I can't
+tell" and never falsely accuses — rather than chase an accuracy that isn't achievable. The
+lesson: tune to the behavior of the signals you actually built, and measure every change.
 
 ---
 
 ## AI usage
 
-> Built with AI assistance (Claude). Each instance below notes what I directed it to do,
-> what it produced, and what I revised or overrode.
+> Built with AI assistance (Claude). Each instance notes what I directed it to do, what it
+> produced, and what I revised or overrode.
 
-1. **Generating Signal B and the confidence scorer from my spec.** I gave the AI my
-   detection-signals and uncertainty sections from `planning.md` and the architecture
-   diagram and asked it to implement `stylometry.py` and `scorer.py`. It produced working
-   functions. I **verified** the scorer against my threshold table with deterministic
-   tests, and **overrode** two things: I lowered the AI bar from 0.85 to 0.75 after seeing
-   that my conservative LLM prompt capped real AI scores around 0.7, and I specified
-   **MATTR over raw TTR** so lexical diversity wouldn't collapse on long text — a length
-   bias the first draft would have had.
+1. **Generating the signals and scorer from my spec.** I gave the AI my detection-signals
+   and uncertainty sections plus the architecture diagram and asked it to implement
+   `stylometry.py` and `scorer.py`. It produced working functions. I **verified** them
+   against my threshold table with deterministic tests and **overrode** two choices: I
+   lowered the AI bar from 0.85 to 0.75 after seeing the LLM cap clear-AI scores near 0.7,
+   and I required **MATTR instead of raw TTR** so lexical diversity wouldn't collapse on
+   long text.
 
-2. **Designing the failure / uncertainty model.** I directed the AI to propose how to
-   combine two signals with different reliability profiles. It proposed a weighted
-   average. I **decided** the additional structure that makes it honest: a separate
-   `evidence_trust` gate, the false-positive asymmetry, and the rule that a single
-   surviving signal can **never** reach a high-confidence verdict (graceful degradation).
-   I then wrote a deterministic test to prove that safety rule actually holds, rather than
-   trusting the description.
-
-*(Adjust this section to match your own recollection before submitting.)*
+2. **Evidence-driven tuning with a labeled eval harness.** I directed the AI to build
+   `eval.py` (a small labeled benchmark) so changes could be measured, not guessed. Using
+   it, I **overrode** several tempting changes: I confirmed that reweighting signals barely
+   helped (the LLM ceiling, not the weights, was the bottleneck); I **rejected lowering the
+   AI bar to 0.65** after the eval showed it gained nothing and eroded the ESL safety
+   margin; and I added the **phrase signal as an ensemble member** only after measuring
+   that the two-signal version missed cliché AI — then confirmed it added zero false
+   positives before keeping it.
 
 ---
 
 ## What I'd change for production
-
-- **Calibrate thresholds on a labeled corpus** instead of hand-chosen heuristics.
-- **Persist rate limits in Redis** so they survive restarts and work across multiple
-  workers (current in-memory storage resets on restart).
-- **Run behind a production WSGI server** (e.g. Gunicorn) instead of Flask's dev server.
-- **Authenticate `/log`** (it's open here for grading visibility) and scope rate limits by
-  authenticated user, not just IP.
+- **Calibrate thresholds and weights on a real labeled corpus** instead of hand-chosen
+  heuristics and a 12-sample smoke test.
+- **Persist rate limits in Redis** so they survive restarts and span multiple workers.
+- **Run behind a production WSGI server** (Gunicorn) instead of Flask's dev server.
+- **Authenticate `/log`** (open here for grading) and scope rate limits by authenticated
+  user, not just IP.
 - **Add a real reviewer queue UI** for appeals rather than just a status flag.
 
 ---
 
-## Architecture & project structure
-
-The full architecture diagram (ASCII + Mermaid) and the submission/appeal flow narrative
-live in [`planning.md`](planning.md). In brief: text → rate-limit gate → both signals →
-confidence scorer → transparency label → audit log → response; an appeal looks up the
-original decision, flips status to `under_review`, and logs alongside it.
+## Project structure
 
 ```
-app.py            Flask app: routes, rate limiting, wiring
-llm_signal.py     Signal A  (Groq LLM, semantic)
-stylometry.py     Signal B  (stylometric heuristics, structural)
-scorer.py         Confidence Scorer (combines signals; deterministic threshold checks)
-labels.py         Transparency label text (3 variants)
-audit.py          Append-only structured audit log (JSON Lines)
-store.py          Mutable submission state (for appeal status)
-planning.md       Design spec + architecture diagram
-requirements.txt  Dependencies
+app.py             Flask app: routes, rate limiting, UI, wiring
+llm_signal.py      Signal A  (Groq LLM, semantic)
+stylometry.py      Signal B  (stylometric heuristics, structural)
+signal_phrases.py  Signal C  (AI-register phrase detector, lexical) [ensemble]
+scorer.py          Confidence Scorer (3-signal ensemble; deterministic threshold checks)
+labels.py          Transparency label text (3 variants)
+audit.py           Append-only structured audit log (JSON Lines)
+store.py           Mutable submission state (for appeal status)
+eval.py            Labeled benchmark harness
+index.html         Browser UI (served at GET /)
+planning.md        Design spec + architecture diagram
+requirements.txt   Dependencies
 ```

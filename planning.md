@@ -99,8 +99,9 @@ flowchart TD
 
 ## 1. Detection Signals
 
-The system uses **two distinct signals** — one reads *meaning*, one counts *form* — so
-their blind spots barely overlap.
+The system uses **three distinct signals** — one reads *meaning*, one counts *form*, one
+matches *lexical markers* — so their blind spots barely overlap. (Signal C was added as
+the Ensemble Detection stretch feature.)
 
 ### Signal A — Groq LLM classifier (semantic)
 - **Measures:** the holistic "feel" of the prose (voice, coherence, idiosyncrasy vs.
@@ -134,11 +135,33 @@ their blind spots barely overlap.
 - **Misses:** meaning-blind; unreliable on short text; gameable both ways; confounded
   by genre (poetry/lists/dialogue); thresholds hand-chosen, not learned.
 
-### Combining the two
-`raw_score = 0.5 * signalA.score + 0.5 * signalB.score` (weights revisited if testing
-shows one signal is more reliable). The two **self_confidence** values feed
-`evidence_trust` (Section 2), which decides whether `raw_score` is trustworthy enough to
-act on. **Detection only gathers evidence; the Confidence Scorer alone decides.**
+### Signal C — AI-register phrase detector (lexical) [Ensemble stretch]
+- **Measures:** density of multi-word phrases typical of the "AI essay" register
+  (*it is important to note, in today's fast-paced world, delve into, a testament to*).
+- **Implementation:** pure Python, deterministic. Uses multi-word phrases (not common
+  single words) to avoid flagging formal human writing.
+- **Output shape:**
+  ```json
+  { "score": 1.0, "self_confidence": 1.0,
+    "components": { "hits": 7, "distinct": 7, "per_100_words": 23.3, "matched": ["..."] } }
+  ```
+- **High precision when it fires; abstains otherwise.** Absence of cliches is weak
+  evidence of a human (natural AI has none either), so self_confidence is high only when
+  markers are found.
+- **Misses:** natural conversational AI (no cliches); gameable by avoiding the phrases.
+
+### Combining the three (ensemble)
+**Confidence-weighted average**, weights **LLM 0.6 / stylometry 0.1 / phrase 0.3**:
+`raw_score = sum(w_i * self_confidence_i * score_i) / sum(w_i * self_confidence_i)`.
+Scaling each vote by its self_confidence lets a signal **abstain** safely — the phrase
+signal's score 0 (no cliches) barely affects the result instead of acting like a "human"
+vote.
+
+**Conflict resolution:** disagreeing signals lower `evidence_trust` (Section 2), which
+forces `uncertain`; the asymmetric AI bar means no single signal alone can accuse. A
+confident phrase hit additionally lifts `evidence_trust` so clear cliche-AI isn't gated
+out by short length. **Detection only gathers evidence; the Confidence Scorer alone
+decides.**
 
 ---
 
@@ -147,7 +170,7 @@ act on. **Detection only gathers evidence; the Confidence Scorer alone decides.*
 Two different 0–1 numbers, kept distinct:
 - **`raw_score`** = *how AI-like* the text is (0 = clearly human, 1 = clearly AI).
 - **`evidence_trust`** = *how much we trust the evidence*, from text length, the
-  signals' self_confidence, and how much the two signals agree.
+  signals' self_confidence, and how much the signals agree.
 - **`confidence`** (the reported headline number) = how sure we are of the attribution =
   `lean_strength * evidence_trust`, where `lean_strength = abs(raw_score - 0.5) * 2`.
 
@@ -176,26 +199,26 @@ evidence — it's two unreliable guesses pointing the same way.
 
 ### Classification pseudocode (implementation-ready)
 ```
-sigA = run_llm_signal(text)          # {score, self_confidence, reason}
-sigB = run_stylometry_signal(text)   # {score, self_confidence, components}
+signals = {llm, stylometry, phrase}    # each: {available, score, self_confidence}
+W = {llm: 0.6, stylometry: 0.1, phrase: 0.3}
 
-raw_score = 0.5*sigA.score + 0.5*sigB.score
-agreement = 1 - abs(sigA.score - sigB.score)           # 1 = identical, 0 = opposite
-length_factor = clamp(word_count / 150, 0, 1)          # short text -> low
-mean_self_conf = mean(sigA.self_confidence, sigB.self_confidence)
+# confidence-weighted average over available signals (abstaining signals fade out)
+raw_score = sum(W[k]*s.self_confidence*s.score) / sum(W[k]*s.self_confidence)
+agreement = 1 - (max - min) over signals with self_confidence >= 0.4   # else 0
+length_factor = clamp(word_count / 150, 0, 1)
+mean_self_conf = mean(s.self_confidence for available signals)
 evidence_trust = mean(length_factor, mean_self_conf, agreement)
+
+if llm unavailable:           evidence_trust = min(evidence_trust, 0.59)   # degrade
+if phrase fired confidently:  evidence_trust = max(evidence_trust, 0.70)   # boost
 
 lean_strength = abs(raw_score - 0.5) * 2
 confidence = lean_strength * evidence_trust
 
-if evidence_trust < 0.60:
-    attribution = "uncertain"
-elif raw_score >= 0.75:
-    attribution = "likely_ai"
-elif raw_score <= 0.35:
-    attribution = "likely_human"
-else:
-    attribution = "uncertain"
+if evidence_trust < 0.60:   attribution = "uncertain"
+elif raw_score >= 0.75:     attribution = "likely_ai"
+elif raw_score <= 0.35:     attribution = "likely_human"
+else:                       attribution = "uncertain"
 ```
 If a signal fails (e.g. Groq down): run on the surviving signal, set the failed
 signal's self_confidence = 0, and force `evidence_trust < 0.60` so the result is always
@@ -324,7 +347,7 @@ for, and how to verify before wiring anything together.
 - **Audit log store:** start with structured JSON for inspectability; switch to SQLite
   if querying `/log` filters gets awkward. Entry shapes are fixed in the API contract.
 - **Placeholder numbers to tune in M4:** AI bar 0.75 (lowered from 0.85 in M4 -- see note), human bar 0.35, trust gate 0.60,
-  signal weights 0.5/0.5, length-guard threshold ~150 words.
+  signal weights 0.6/0.1/0.3 (LLM/stylometry/phrase; confidence-weighted), length-guard threshold ~150 words.
 - **Stretch features:** update this file before starting any (ensemble weighting,
   provenance certificate, analytics dashboard, multi-modal). Signal B's three
   sub-metrics already set up the ensemble stretch cleanly.
