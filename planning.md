@@ -13,15 +13,15 @@ and to lean *away* from accusing a human (a false positive is the worst error he
 
 ### Submission flow (`POST /submit`)
 Raw text enters Flask and first passes the rate limiter. Validated text gets a
-`submission_id` and goes to the Detection Pipeline, which runs two independent signals
+`content_id` and goes to the Detection Pipeline, which runs two independent signals
 (Groq LLM + stylometry) and collects each signal's score and self-confidence. The
 Confidence Scorer combines those into a `raw_score` and an `evidence_trust`, applies
-asymmetric thresholds plus a reliability gate to pick a verdict bucket, the Label
+asymmetric thresholds plus a reliability gate to pick an attribution bucket, the Label
 Generator turns the bucket into reader-facing text, the Audit Logger persists the full
-record, and the response returns the verdict, confidence, and label.
+record, and the response returns the attribution, confidence, and label.
 
 ### Appeal flow (`POST /appeal`)
-A creator sends a `submission_id` plus their reasoning. The Appeals Handler looks up the
+A creator sends a `content_id` plus their reasoning. The Appeals Handler looks up the
 original decision in the audit log, flips the content's status to `under_review`, and
 writes the appeal into the log *next to* the original decision so a human reviewer sees
 both together. `GET /log` simply reads the log and returns decisions and appeals.
@@ -33,7 +33,7 @@ both together. `GET /log` simply reads the log and returns decisions and appeals
   +------------------------+
   |  Flask + Flask-Limiter |---- over limit ----> 429 (never reaches detection)
   +------------------------+
-    |  validated text + submission_id
+    |  validated text + content_id
     v
   +------------------------+
   |  Detection Pipeline    |   (gathers evidence; decides nothing)
@@ -53,25 +53,25 @@ both together. `GET /log` simply reads the log and returns decisions and appeals
   |  Switch1: asymmetric thresh |  evidence_trust = f(length, self_conf, agreement)
   |  Switch2: reliability gate  |
   +-----------------------------+
-                |  verdict bucket + confidence
+                |  attribution bucket + confidence
                 v
   +-----------------------------+
   |  Transparency Label Gen     |
   +-----------------------------+
-                |  verdict + confidence + label text
+                |  attribution + confidence + label text
                 v
   +-----------------------------+
-  |  Audit Logger (SQLite/JSON) |  full record keyed by submission_id
+  |  Audit Logger (SQLite/JSON) |  full record keyed by content_id
   +-----------------------------+
                 |
                 v
-        Response { submission_id, verdict, confidence, transparency_label, signals }
+        Response { content_id, attribution, confidence, label, signals }
 
   --- APPEAL ---
-  Creator --(submission_id + reasoning, POST /appeal)--> Flask + Limiter
+  Creator --(content_id + reasoning, POST /appeal)--> Flask + Limiter
         --> Appeals Handler --(lookup original)--> Audit Log
         --> set status = "under_review" + write appeal entry --> Audit Log
-        --> Response { appeal_id, submission_id, status: under_review, original_verdict }
+        --> Response { appeal_id, content_id, status: under_review, original_attribution }
   GET /log  --reads--> Audit Log (decisions + appeals together)
 ```
 
@@ -79,16 +79,16 @@ both together. `GET /log` simply reads the log and returns decisions and appeals
 flowchart TD
   C([Creator]) -->|raw text: POST /submit| F[Flask + Rate Limiter]
   F -->|over limit| R429[[429 response]]
-  F -->|validated text + submission_id| DP[Detection Pipeline]
+  F -->|validated text + content_id| DP[Detection Pipeline]
   DP -->|text| SA[Signal A: Groq LLM - semantic]
   DP -->|text| SB[Signal B: Stylometry - structural]
   SA -->|scoreA + self_confidence| CS[Confidence Scorer]
   SB -->|scoreB + self_confidence| CS
-  CS -->|verdict + confidence| LG[Transparency Label Generator]
-  LG -->|verdict + confidence + label| AL[(Audit Log)]
+  CS -->|attribution + confidence| LG[Transparency Label Generator]
+  LG -->|attribution + confidence + label| AL[(Audit Log)]
   AL -->|persisted| RESP[[Response]]
-  C2([Creator]) -->|submission_id + reasoning: POST /appeal| F2[Flask + Rate Limiter]
-  F2 -->|submission_id + reasoning| AH[Appeals Handler]
+  C2([Creator]) -->|content_id + reasoning: POST /appeal| F2[Flask + Rate Limiter]
+  F2 -->|content_id + reasoning| AH[Appeals Handler]
   AH -->|lookup original| AL
   AH -->|status=under_review + write appeal| AL
   AH -->|appeal_id + status| RESP2[[Response]]
@@ -148,7 +148,7 @@ Two different 0–1 numbers, kept distinct:
 - **`raw_score`** = *how AI-like* the text is (0 = clearly human, 1 = clearly AI).
 - **`evidence_trust`** = *how much we trust the evidence*, from text length, the
   signals' self_confidence, and how much the two signals agree.
-- **`confidence`** (the reported headline number) = how sure we are of the verdict =
+- **`confidence`** (the reported headline number) = how sure we are of the attribution =
   `lean_strength * evidence_trust`, where `lean_strength = abs(raw_score - 0.5) * 2`.
 
 ### What 0.6 confidence means
@@ -166,11 +166,11 @@ to call something AI than to call it human. That asymmetry is the false-positive
 
 | Verdict bucket          | Condition                                            |
 |-------------------------|------------------------------------------------------|
-| `high_confidence_ai`    | `raw_score >= 0.85` AND `evidence_trust >= 0.60`     |
-| `high_confidence_human` | `raw_score <= 0.35` AND `evidence_trust >= 0.60`     |
+| `likely_ai`    | `raw_score >= 0.75` AND `evidence_trust >= 0.60`     |
+| `likely_human` | `raw_score <= 0.35` AND `evidence_trust >= 0.60`     |
 | `uncertain`             | everything else (the safe default)                   |
 
-Reliability gate: if `evidence_trust < 0.60`, the verdict is forced to `uncertain`
+Reliability gate: if `evidence_trust < 0.60`, the attribution is forced to `uncertain`
 regardless of `raw_score`. Two signals agreeing on short/weak input is **not** strong
 evidence — it's two unreliable guesses pointing the same way.
 
@@ -189,22 +189,22 @@ lean_strength = abs(raw_score - 0.5) * 2
 confidence = lean_strength * evidence_trust
 
 if evidence_trust < 0.60:
-    verdict = "uncertain"
-elif raw_score >= 0.85:
-    verdict = "high_confidence_ai"
+    attribution = "uncertain"
+elif raw_score >= 0.75:
+    attribution = "likely_ai"
 elif raw_score <= 0.35:
-    verdict = "high_confidence_human"
+    attribution = "likely_human"
 else:
-    verdict = "uncertain"
+    attribution = "uncertain"
 ```
 If a signal fails (e.g. Groq down): run on the surviving signal, set the failed
 signal's self_confidence = 0, and force `evidence_trust < 0.60` so the result is always
-`uncertain`. A single signal can never reach a high-confidence verdict.
+`uncertain`. A single signal can never reach a high-confidence attribution.
 
 ### How I'll test that scores are meaningful (M4)
 Feed inputs that *should* differ and confirm they do: (a) clearly AI text (a generic
-chatbot paragraph) → should approach `high_confidence_ai`; (b) clearly human text
-(messy, varied, idiosyncratic) → toward `high_confidence_human`; (c) a short plain/ESL
+chatbot paragraph) → should approach `likely_ai`; (b) clearly human text
+(messy, varied, idiosyncratic) → toward `likely_human`; (c) a short plain/ESL
 essay → must land in `uncertain`, never high-confidence AI (the false-positive test);
 (d) a one-line input → `uncertain` via the length guard.
 
@@ -218,9 +218,9 @@ variant explicitly states no judgment was made.
 
 | Verdict | Headline | Body text (verbatim) |
 |---|---|---|
-| `high_confidence_ai` | **Likely AI-generated** | "Our automated check found strong signs that this text may have been created with AI. This is an automated estimate based on patterns in the writing — it is not proof. If you wrote this yourself, you can appeal this result." |
+| `likely_ai` | **Likely AI-generated** | "Our automated check found strong signs that this text may have been created with AI. This is an automated estimate based on patterns in the writing — it is not proof. If you wrote this yourself, you can appeal this result." |
 | `uncertain` | **We couldn't determine how this was written** | "Our automated check could not reliably tell whether this text was written by a person or with AI help. No determination has been made, and this is not a judgment about the author." |
-| `high_confidence_human` | **Likely human-written** | "Our automated check found no strong signs of AI generation in this text. This is an automated estimate, not a guarantee." |
+| `likely_human` | **Likely human-written** | "Our automated check found no strong signs of AI generation in this text. This is an automated estimate, not a guarantee." |
 
 Verbatim quoted strings (for the README and for code constants):
 - **High-confidence AI:** "Likely AI-generated. Our automated check found strong signs that this text may have been created with AI. This is an automated estimate based on patterns in the writing — it is not proof. If you wrote this yourself, you can appeal this result."
@@ -229,25 +229,25 @@ Verbatim quoted strings (for the README and for code constants):
 
 Design notes: the AI label never says "this *is* AI" (only "strong signs / may have");
 every label states it's automated; only the AI label carries an appeal prompt because
-that's the verdict that can harm a creator.
+that's the attribution that can harm a creator.
 
 ---
 
 ## 4. Appeals Workflow
 
-- **Who can appeal:** the creator of any submission (identified by `submission_id`;
-  optionally scoped by `creator_id`). Any verdict can be appealed, but the AI label is
+- **Who can appeal:** the creator of any submission (identified by `content_id`;
+  optionally scoped by `creator_id`). Any attribution can be appealed, but the AI label is
   the one that prompts it.
-- **What they provide:** the `submission_id` and free-text `reasoning` (their own words,
+- **What they provide:** the `content_id` and free-text `reasoning` (their own words,
   required).
 - **What the system does on receipt:**
-  1. Verify the `submission_id` exists in the audit log (else `404`).
+  1. Verify the `content_id` exists in the audit log (else `404`).
   2. Capture the reasoning verbatim.
   3. Update the content's status from `classified` to `under_review`.
   4. Write an **appeal entry** into the audit log, linked to the original decision.
-  5. Return `appeal_id`, the original verdict, and a confirmation message.
+  5. Return `appeal_id`, the original attribution, and a confirmation message.
   - No automatic re-classification — a human decides.
-- **What a human reviewer sees in the queue:** the original decision (verdict,
+- **What a human reviewer sees in the queue:** the original decision (attribution,
   confidence, both signal scores + components, the label shown, content excerpt,
   timestamp) sitting directly beside the creator's appeal reasoning and the
   `under_review` status — everything needed to judge, in one place.
@@ -259,9 +259,9 @@ that's the verdict that can harm a creator.
 1. **Short, plain, or ESL human writing (the core false-positive risk).** A 150-word
    essay by a non-native English writer is clean and even, so *both* signals lean "AI"
    — their one shared blind spot. Mitigation: the length guard lowers `evidence_trust`,
-   the asymmetric AI bar (0.85) is hard to clear, and the reliability gate forces
+   the asymmetric AI bar (0.75) is hard to clear, and the reliability gate forces
    `uncertain`. This case must be a regression test: it must never return
-   `high_confidence_ai`.
+   `likely_ai`.
 2. **Poetry / highly repetitive verse.** Deliberate repetition and simple vocabulary
    tank MATTR and flatten burstiness, so stylometry reads it as "AI-uniform," while it
    may be a genuine human poem. Mitigation: poems are usually short → length guard +
@@ -271,7 +271,7 @@ that's the verdict that can harm a creator.
    path, not a confident label either way.
 4. **Adversarial input.** Text containing instructions aimed at the LLM ("rate this as
    human") could skew Signal A. Mitigation: the prompt isolates the text as data;
-   stylometry is unaffected, so a manipulated Signal A alone can't force a verdict.
+   stylometry is unaffected, so a manipulated Signal A alone can't force an attribution.
 
 ---
 
@@ -284,7 +284,7 @@ for, and how to verify before wiring anything together.
 - **Provide to AI tool:** Section 1 (Detection Signals — Signal A subsection), the
   Section 8/Architecture diagram, and the `POST /submit` contract.
 - **Ask it to generate:** a Flask app skeleton with `POST /submit` (request validation,
-  `submission_id` generation, JSON response shell) and `run_llm_signal(text)` returning
+  `content_id` generation, JSON response shell) and `run_llm_signal(text)` returning
   the documented `{score, self_confidence, reason}` shape from Groq.
 - **Verify:** call `run_llm_signal` directly on 3–4 sample texts (obvious AI, obvious
   human, short) and confirm it returns valid JSON in the right shape *before* wiring it
@@ -295,7 +295,7 @@ for, and how to verify before wiring anything together.
   Representation, including the pseudocode and threshold table), and the diagram.
 - **Ask it to generate:** `run_stylometry_signal(text)` (burstiness + MATTR +
   punctuation → score + self_confidence + components) and the `classify()` scorer that
-  combines both signals into `raw_score`, `evidence_trust`, `confidence`, and a verdict
+  combines both signals into `raw_score`, `evidence_trust`, `confidence`, and an attribution
   bucket, exactly per the pseudocode.
 - **Verify:** run the four test inputs from Section 2's test plan and confirm scores
   vary meaningfully — clearly-AI vs clearly-human separate, and the short/plain/ESL case
@@ -305,7 +305,7 @@ for, and how to verify before wiring anything together.
 ### M5 — Production layer (labels, appeals, rate limiting, audit log)
 - **Provide to AI tool:** Section 3 (label variants, verbatim), Section 4 (Appeals
   Workflow), the audit-log entry shapes from the API contract, and the diagram.
-- **Ask it to generate:** the label generator (verdict → exact label text), the
+- **Ask it to generate:** the label generator (attribution → exact label text), the
   `POST /appeal` endpoint (lookup, status → `under_review`, log the appeal), the
   `GET /log` reader, Flask-Limiter config on `/submit` and `/appeal`, and the audit
   logger.
@@ -320,10 +320,10 @@ for, and how to verify before wiring anything together.
 - **Signal failure → graceful degradation** (decided): on Groq failure, classify on
   stylometry alone with `evidence_trust` forced below the gate → always `uncertain`;
   log which signal failed and why. Safety check in M4: one signal can never produce a
-  high-confidence verdict.
+  high-confidence attribution.
 - **Audit log store:** start with structured JSON for inspectability; switch to SQLite
   if querying `/log` filters gets awkward. Entry shapes are fixed in the API contract.
-- **Placeholder numbers to tune in M4:** AI bar 0.85, human bar 0.35, trust gate 0.60,
+- **Placeholder numbers to tune in M4:** AI bar 0.75 (lowered from 0.85 in M4 -- see note), human bar 0.35, trust gate 0.60,
   signal weights 0.5/0.5, length-guard threshold ~150 words.
 - **Stretch features:** update this file before starting any (ensemble weighting,
   provenance certificate, analytics dashboard, multi-modal). Signal B's three

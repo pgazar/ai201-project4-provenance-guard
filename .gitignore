@@ -11,3 +11,7 @@ prelabel_cache.json
 
 # Optional: uncomment if you don't want the raw saved JSON in the repo
 # raw_json/
+
+# Runtime data (regenerated each run; curated sample lives in README)
+audit_log.jsonl
+submissions.json
