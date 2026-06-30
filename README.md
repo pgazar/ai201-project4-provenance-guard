@@ -290,7 +290,7 @@ now `under_review`.
 
 **Two storage mechanisms, on purpose:** the audit log is an append-only *ledger* (history
 you never rewrite); a submission's *current status* is mutable state, so it lives
-separately in `submissions.json`. Conflating them would mean rewriting log lines to change
+separately in a SQLite database (`submissions.db`). Conflating them would mean rewriting log lines to change
 a status, which breaks the integrity of a ledger.
 
 ---
@@ -420,7 +420,7 @@ signal_phrases.py  Signal C  (AI-register phrase detector, lexical) [ensemble]
 scorer.py          Confidence Scorer (3-signal ensemble; deterministic threshold checks)
 labels.py          Transparency label text (3 variants)
 audit.py           Append-only structured audit log (JSON Lines)
-store.py           Mutable submission state (for appeal status)
+store.py           Mutable submission state (SQLite; atomic status updates)
 eval.py            Labeled benchmark harness
 index.html         Browser UI (served at GET /)
 planning.md        Design spec + architecture diagram

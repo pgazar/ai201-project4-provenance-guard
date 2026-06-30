@@ -14,4 +14,6 @@ prelabel_cache.json
 
 # Runtime data (regenerated each run; curated sample lives in README)
 audit_log.jsonl
-submissions.json
+submissions.db
+submissions.db-wal
+submissions.db-shm
